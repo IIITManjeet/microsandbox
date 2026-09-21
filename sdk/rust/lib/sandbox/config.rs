@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZero;
 use std::path::PathBuf;
 
+#[cfg(feature = "net")]
+use microsandbox_network::config::NetworkConfig;
 use microsandbox_runtime::logging::LogLevel;
 use microsandbox_types::{
     EnvVar, SandboxLogLevel, SandboxResources, SandboxRuntimeOptions, SandboxSpec,
@@ -14,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use microsandbox_image::{ImageConfig, RegistryAuth};
 use microsandbox_protocol::{HANDOFF_INIT_AUTO, HANDOFF_INIT_IMAGE_ENTRYPOINT_CANDIDATES};
 use typed_path::Utf8UnixPath;
+
+use crate::MicrosandboxResult;
 
 use super::types::{MountOptions, RootDisk, RootfsSource, VolumeMount};
 
@@ -405,7 +409,7 @@ impl SandboxConfig {
     pub(crate) fn apply_rootfs_defaults(
         &mut self,
         defaults: &crate::config::OciSandboxDefaults,
-    ) -> crate::MicrosandboxResult<()> {
+    ) -> MicrosandboxResult<()> {
         if defaults.upper_size_mib.is_some() && defaults.root_disk.is_some() {
             return Err(crate::MicrosandboxError::InvalidConfig(
                 "sandbox_defaults.oci.root_disk and deprecated sandbox_defaults.oci.upper_size_mib are mutually exclusive".into(),
@@ -467,6 +471,22 @@ impl SandboxConfig {
             size_mib: Some(default_oci_tmpfs_size_mib(self.spec.resources.memory_mib)),
             options: MountOptions::default(),
         });
+    }
+
+    #[cfg(feature = "net")]
+    pub(crate) fn local_network_config(&self) -> MicrosandboxResult<NetworkConfig> {
+        Ok(serde_json::from_value(serde_json::to_value(
+            &self.spec.network,
+        )?)?)
+    }
+
+    #[cfg(feature = "net")]
+    pub(crate) fn set_local_network_config(
+        &mut self,
+        config: NetworkConfig,
+    ) -> MicrosandboxResult<()> {
+        self.spec.network = serde_json::from_value(serde_json::to_value(config)?)?;
+        Ok(())
     }
 }
 
@@ -569,54 +589,20 @@ pub(crate) fn sandbox_log_level_from_runtime(level: LogLevel) -> SandboxLogLevel
     }
 }
 
-#[cfg(feature = "net")]
-pub(crate) fn network_spec_from_config(
-    config: &microsandbox_network::config::NetworkConfig,
-) -> crate::MicrosandboxResult<microsandbox_types::NetworkSpec> {
-    Ok(serde_json::from_value(serde_json::to_value(config)?)?)
-}
-
-#[cfg(feature = "net")]
-pub(crate) fn network_config_from_spec(
-    spec: &microsandbox_types::NetworkSpec,
-) -> crate::MicrosandboxResult<microsandbox_network::config::NetworkConfig> {
-    Ok(serde_json::from_value(serde_json::to_value(spec)?)?)
-}
-
-/// Enforce the invariant that a non-empty secret set requires TLS
-/// interception, returning whether `tls.enabled` had to be flipped. The
-/// proxy is what substitutes secrets, so without interception the
-/// placeholder reaches the upstream unchanged.
+/// Enable TLS interception for a non-empty secret set, returning whether
+/// `tls.enabled` had to be flipped.
 ///
-/// One-way: emptying the secret set leaves interception on, since
-/// `TlsConfig::enabled` records no provenance and callers enable it
-/// independently of secrets.
+/// This preserves the top-level sandbox builder's create-time policy, which
+/// enables interception for every secret entry. Lower-level network configs
+/// may intentionally keep interception off for plain-HTTP secrets that opt
+/// out of TLS identity checks.
 #[cfg(feature = "net")]
-pub(crate) fn ensure_tls_for_secrets(
-    network: &mut microsandbox_network::config::NetworkConfig,
-) -> bool {
+pub(crate) fn ensure_tls_for_secrets(network: &mut NetworkConfig) -> bool {
     if network.secrets.secrets.is_empty() || network.tls.enabled {
         return false;
     }
     network.tls.enabled = true;
     true
-}
-
-#[cfg(feature = "net")]
-impl SandboxConfig {
-    pub(crate) fn local_network_config(
-        &self,
-    ) -> crate::MicrosandboxResult<microsandbox_network::config::NetworkConfig> {
-        network_config_from_spec(&self.spec.network)
-    }
-
-    pub(crate) fn set_local_network_config(
-        &mut self,
-        config: microsandbox_network::config::NetworkConfig,
-    ) -> crate::MicrosandboxResult<()> {
-        self.spec.network = network_spec_from_config(&config)?;
-        Ok(())
-    }
 }
 
 /// Resolve reference-model secret entries (host-side `source` references) into
@@ -630,7 +616,7 @@ impl SandboxConfig {
 #[cfg(feature = "net")]
 pub(crate) fn resolve_config_secret_sources(
     config: &SandboxConfig,
-) -> crate::MicrosandboxResult<Option<SandboxConfig>> {
+) -> MicrosandboxResult<Option<SandboxConfig>> {
     use microsandbox_network::secrets::config::SecretSource;
 
     if !config.spec.network.enabled {
@@ -1774,7 +1760,7 @@ mod tests {
             allowed_hosts: vec![HostPattern::Exact("api.example.com".into())],
             injection: Default::default(),
             on_violation: None,
-            require_tls_identity: true,
+            require_tls_identity: false,
         });
         assert!(super::ensure_tls_for_secrets(&mut network));
         assert!(network.tls.enabled);

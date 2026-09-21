@@ -44,7 +44,7 @@ const SECRETS_UNAVAILABLE_WITHOUT_NET: &str =
 const SECRET_FIELD: &str = "secret";
 const TLS_FIELD: &str = "tls";
 const TLS_INTERCEPTION_REQUIRES_RESTART: &str =
-    "secrets require TLS interception, which cannot be enabled on a running sandbox";
+    "TLS-identity secrets require interception, which cannot be enabled on a running sandbox";
 const ROOT_DISK_FIELD: &str = "root_disk_size";
 const ENV_FIELD: &str = "env";
 const LABEL_FIELD: &str = "label";
@@ -298,11 +298,11 @@ impl SandboxModificationBuilder {
     /// source-based specs and persists the value for value-based specs (the
     /// same at-rest property as create's `secret_env`).
     ///
-    /// Configuring a secret on a sandbox with TLS interception off also
-    /// turns interception on, matching create's `secret` — secrets are
-    /// substituted by the TLS proxy, so they do nothing without it. That is
-    /// planned as a `tls` change and, like every other restart-backed change,
-    /// needs `restart` or `next_start` on a running sandbox.
+    /// Configuring a secret that requires TLS identity on a sandbox with
+    /// interception off also turns interception on. That is planned as a
+    /// `tls` change and, like every other restart-backed change, needs
+    /// `restart` or `next_start` on a running sandbox. Existing secrets that
+    /// opt out of TLS identity continue to support live plain-HTTP updates.
     pub async fn apply(self) -> MicrosandboxResult<SandboxModificationPlan> {
         let handle = self
             .backend
@@ -976,10 +976,12 @@ fn apply_secret_patch_to_config(
         .secrets
         .secrets
         .retain(|entry| !patch.secrets_remove.contains(&entry.env_var));
-    // Same invariant create upholds in `SandboxBuilder::secret_entry`. The
-    // planner emits a matching `tls` change under the same condition, so the
-    // plan cannot disagree with what is persisted.
-    super::config::ensure_tls_for_secrets(&mut network);
+    // TLS-identity secrets require interception; deliberate plain-HTTP
+    // secrets do not. This is one-way because TLS may have been enabled for
+    // independent reasons.
+    if !network.tls.enabled && network.secrets.has_tls_identity_secrets() {
+        network.tls.enabled = true;
+    }
     // Enforce env-var and placeholder shape rules before anything persists;
     // validation errors carry entry indexes and sizes, never values.
     network.secrets.validate().map_err(|err| {
@@ -1674,8 +1676,9 @@ fn push_secret_changes(
     // Surface the implied TLS enable as its own change rather than flipping
     // a config field invisibly: it keeps the dry-run honest and routes the
     // patch through the restart path, the only way interception can start.
-    // Removal-only patches enable nothing, so they emit nothing.
-    if !patch.secrets.is_empty() && !tls_interception_enabled(config) {
+    // Check the post-patch secret set so removals, TLS-identity opt-outs, and
+    // mixed secret sets cannot make the plan disagree with persisted state.
+    if secret_patch_requires_tls_enable(config, patch) {
         changes.push(spec_change(
             TLS_FIELD,
             ChangeKind::Updated,
@@ -2266,21 +2269,45 @@ fn existing_secret_from_network_config(
     None
 }
 
-/// Whether the config already has TLS interception on. An unreadable network
-/// config counts as disabled: a redundant `tls` change beats a secret landing
-/// without interception.
-#[cfg(feature = "net")]
-fn tls_interception_enabled(config: &SandboxConfig) -> bool {
-    config
-        .local_network_config()
-        .map(|network| network.tls.enabled)
-        .unwrap_or(false)
-}
+/// Whether the post-patch secret set requires enabling TLS interception.
+///
+/// Existing entries retain their `require_tls_identity` setting when modified;
+/// new entries use the TLS-identity default. Removals are evaluated last, just
+/// like persistence, without copying or resolving any secret material.
+/// Without `net`, secret changes are already unsupported and this returns
+/// `false` rather than adding a second planned change.
+fn secret_patch_requires_tls_enable(
+    config: &SandboxConfig,
+    patch: &SandboxModificationPatch,
+) -> bool {
+    #[cfg(not(feature = "net"))]
+    {
+        let _ = (config, patch);
+        false
+    }
 
-/// Without `net`, secret changes already plan as unsupported; no `tls` on top.
-#[cfg(not(feature = "net"))]
-fn tls_interception_enabled(_config: &SandboxConfig) -> bool {
-    true
+    #[cfg(feature = "net")]
+    {
+        if patch.secrets.is_empty() && patch.secrets_remove.is_empty() {
+            return false;
+        }
+        let Ok(network) = config.local_network_config() else {
+            return false;
+        };
+        if network.tls.enabled {
+            return false;
+        }
+
+        let tls_identity_secret_remains = network.secrets.secrets.iter().any(|entry| {
+            entry.require_tls_identity && !patch.secrets_remove.contains(&entry.env_var)
+        });
+        let tls_identity_secret_is_added = patch.secrets.iter().any(|spec| {
+            !patch.secrets_remove.contains(&spec.name)
+                && !network.secrets.contains_env_var(&spec.name)
+        });
+
+        tls_identity_secret_remains || tls_identity_secret_is_added
+    }
 }
 
 #[cfg(feature = "net")]
@@ -3484,7 +3511,7 @@ mod tests {
             on_violation: None,
             require_tls_identity: true,
         });
-        // Mirror the invariant every real entry point upholds.
+        // Mirror the top-level sandbox builder's create-time policy.
         crate::sandbox::config::ensure_tls_for_secrets(&mut network);
         config.set_local_network_config(network).unwrap();
         config
@@ -3496,6 +3523,17 @@ mod tests {
         let mut config = config_with_secret(name, value);
         let mut network = config.local_network_config().unwrap();
         network.tls.enabled = false;
+        config.set_local_network_config(network).unwrap();
+        config
+    }
+
+    /// A deliberate plain-HTTP secret configuration: substitution is allowed
+    /// without TLS identity, so interception stays off.
+    #[cfg(feature = "net")]
+    fn config_with_plain_http_secret_and_tls_disabled(name: &str, value: &str) -> SandboxConfig {
+        let mut config = config_with_secret_and_tls_disabled(name, value);
+        let mut network = config.local_network_config().unwrap();
+        network.secrets.secrets[0].require_tls_identity = false;
         config.set_local_network_config(network).unwrap();
         config
     }
@@ -4030,6 +4068,123 @@ mod tests {
         );
         let err = validate_apply_supported(&plan).unwrap_err().to_string();
         assert_eq!(err, "cannot apply modification: tls requires restart");
+    }
+
+    /// Plain-HTTP substitution is an intentional TLS-off configuration, so a
+    /// live rotation must not enable interception or force a restart.
+    #[cfg(feature = "net")]
+    #[test]
+    fn live_plain_http_secret_rotation_does_not_enable_tls() {
+        let mut config = config_with_plain_http_secret_and_tls_disabled("API_KEY", SECRET_SENTINEL);
+        let patch = patch_with_specs(vec![source_spec("API_KEY", &[])]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                resize: false,
+                secrets: true,
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
+        assert_eq!(
+            secret_plan_dispositions(&plan),
+            vec![ModificationDisposition::Live]
+        );
+        assert!(validate_apply_supported(&plan).is_ok());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert!(!network.tls.enabled);
+        assert!(!network.secrets.secrets[0].require_tls_identity);
+    }
+
+    /// A removal-only patch can leave another TLS-dependent secret behind.
+    /// Planning and persistence must both surface the implied TLS enable.
+    #[cfg(feature = "net")]
+    #[test]
+    fn removing_one_legacy_secret_plans_tls_for_the_remaining_secret() {
+        let mut config = config_with_secret_and_tls_disabled("KEEP", SECRET_SENTINEL);
+        let mut network = config.local_network_config().unwrap();
+        let mut removed = network.secrets.secrets[0].clone();
+        removed.env_var = "REMOVE".to_string();
+        removed.placeholder = "$MSB_REMOVE".to_string();
+        network.secrets.secrets.push(removed);
+        config.set_local_network_config(network).unwrap();
+        let patch = SandboxModificationPatch {
+            secrets_remove: vec!["REMOVE".to_string()],
+            ..SandboxModificationPatch::default()
+        };
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                resize: false,
+                secrets: true,
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert_eq!(
+            tls_plan_change(&plan).unwrap().disposition,
+            ModificationDisposition::RequiresRestart
+        );
+        assert!(validate_apply_supported(&plan).is_err());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert_eq!(network.secrets.secrets[0].env_var, "KEEP");
+        assert!(network.tls.enabled);
+    }
+
+    /// Removal-only patches that leave only plain-HTTP secrets remain live and
+    /// keep interception disabled.
+    #[cfg(feature = "net")]
+    #[test]
+    fn removing_one_plain_http_secret_keeps_tls_disabled() {
+        let mut config = config_with_plain_http_secret_and_tls_disabled("KEEP", SECRET_SENTINEL);
+        let mut network = config.local_network_config().unwrap();
+        let mut removed = network.secrets.secrets[0].clone();
+        removed.env_var = "REMOVE".to_string();
+        removed.placeholder = "$MSB_REMOVE".to_string();
+        network.secrets.secrets.push(removed);
+        config.set_local_network_config(network).unwrap();
+        let patch = SandboxModificationPatch {
+            secrets_remove: vec!["REMOVE".to_string()],
+            ..SandboxModificationPatch::default()
+        };
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                resize: false,
+                secrets: true,
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
+        assert!(validate_apply_supported(&plan).is_ok());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert_eq!(network.secrets.secrets.len(), 1);
+        assert_eq!(network.secrets.secrets[0].env_var, "KEEP");
+        assert!(!network.tls.enabled);
     }
 
     /// One-way: emptying the secret set must not turn interception off.

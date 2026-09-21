@@ -1,6 +1,6 @@
 //! Sandbox modification planning.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use microsandbox_types::{
     EnvVar, RootDisk, RootfsSource, SecretSubstitution, SecretViolationAction,
@@ -2755,9 +2755,10 @@ fn existing_secret_from_network_config(
 
 /// Whether the post-patch secret set requires enabling TLS interception.
 ///
-/// Existing entries retain their `require_tls_identity` setting when modified;
-/// new entries use the TLS-identity default. Removals are evaluated last, just
-/// like persistence, without copying or resolving any secret material.
+/// Existing entries retain their `require_tls_identity` setting unless the
+/// patch overrides it; new entries use the TLS-identity default unless they
+/// explicitly opt out. Removals are evaluated last, just like persistence,
+/// without copying or resolving any secret material.
 /// Without `net`, secret changes are already unsupported and this returns
 /// `false` rather than adding a second planned change.
 fn secret_patch_requires_tls_enable(
@@ -2782,15 +2783,24 @@ fn secret_patch_requires_tls_enable(
             return false;
         }
 
-        let tls_identity_secret_remains = network.secrets.secrets.iter().any(|entry| {
-            entry.require_tls_identity && !patch.secrets_remove.contains(&entry.env_var)
-        });
-        let tls_identity_secret_is_added = patch.secrets.iter().any(|spec| {
-            !patch.secrets_remove.contains(&spec.name)
-                && !network.secrets.contains_env_var(&spec.name)
-        });
+        let mut tls_identity_by_name: HashMap<&str, bool> = network
+            .secrets
+            .secrets
+            .iter()
+            .map(|entry| (entry.env_var.as_str(), entry.require_tls_identity))
+            .collect();
+        for spec in &patch.secrets {
+            let required = spec
+                .require_tls_identity
+                .or_else(|| tls_identity_by_name.get(spec.name.as_str()).copied())
+                .unwrap_or(true);
+            tls_identity_by_name.insert(spec.name.as_str(), required);
+        }
+        for name in &patch.secrets_remove {
+            tls_identity_by_name.remove(name.as_str());
+        }
 
-        tls_identity_secret_remains || tls_identity_secret_is_added
+        tls_identity_by_name.values().any(|required| *required)
     }
 }
 
@@ -5102,6 +5112,72 @@ mod tests {
             vec![ModificationDisposition::Live]
         );
         assert!(validate_apply_supported(&plan).is_ok());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert!(!network.tls.enabled);
+        assert!(!network.secrets.secrets[0].require_tls_identity);
+    }
+
+    /// Enabling TLS identity on an existing plain-HTTP secret must plan the
+    /// interception restart that persistence will require.
+    #[cfg(feature = "net")]
+    #[test]
+    fn enabling_tls_identity_on_existing_secret_plans_tls_restart() {
+        let mut config = config_with_plain_http_secret_and_tls_disabled("API_KEY", SECRET_SENTINEL);
+        let mut spec = source_spec("API_KEY", &[]);
+        spec.require_tls_identity = Some(true);
+        let patch = patch_with_specs(vec![spec]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert_eq!(
+            tls_plan_change(&plan).unwrap().disposition,
+            ModificationDisposition::RequiresRestart
+        );
+        assert!(validate_apply_supported(&plan).is_err());
+
+        apply_secret_patch_to_config(&mut config, &patch).unwrap();
+        let network = config.local_network_config().unwrap();
+        assert!(network.tls.enabled);
+        assert!(network.secrets.secrets[0].require_tls_identity);
+    }
+
+    /// A new secret can explicitly opt out of TLS identity, so persistence
+    /// and planning must both leave interception disabled.
+    #[cfg(feature = "net")]
+    #[test]
+    fn adding_plain_http_secret_does_not_plan_tls_enable() {
+        let mut config = config(2, 1024);
+        let mut spec = source_spec("API_KEY", &["api.example.com"]);
+        spec.require_tls_identity = Some(false);
+        let patch = patch_with_specs(vec![spec]);
+
+        let plan = build_plan(
+            "api".to_string(),
+            SandboxStatus::Running,
+            &config,
+            None,
+            LiveControl {
+                secrets: true,
+                ..LiveControl::default()
+            },
+            patch.clone(),
+            ModificationPolicy::NoRestart,
+        );
+
+        assert!(tls_plan_change(&plan).is_none());
 
         apply_secret_patch_to_config(&mut config, &patch).unwrap();
         let network = config.local_network_config().unwrap();

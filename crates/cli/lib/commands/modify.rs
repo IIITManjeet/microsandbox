@@ -7,10 +7,12 @@ use console::style;
 use microsandbox::MicrosandboxError;
 use microsandbox::sandbox::{
     ChangeKind, ConfigPlannedChange, ModificationDisposition, ModificationWarning, PlannedChange,
-    ResourceConvergenceState, ResourceKind, ResourceResizeStatus, Sandbox,
+    ResourceConvergenceState, ResourceKind, ResourceResizeStatus, Sandbox, SandboxHandle,
     SandboxModificationBuilder, SandboxModificationPlan, SecretChangeKind, SecretPlannedChange,
     SecretSource,
 };
+use microsandbox_protocol::control::DEFAULT_REQUEST_TIMEOUT;
+use tokio::time::Instant;
 
 use super::common;
 use crate::ui;
@@ -215,14 +217,11 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
     let mut applied = builder.apply().await?;
     let mut resized = false;
     if args.wait {
-        let before_wait = if applied.resize_status.is_empty() {
-            handle.resize_status().await?
-        } else {
-            Vec::new()
-        };
-        resized = confirm_resized(&applied.resize_status, &before_wait);
-        let timeout = resize_wait_budget(args.timeout);
-        match handle.wait_until_resized_with_timeout(timeout).await {
+        let budget = resize_wait_budget(args.timeout);
+        let (result, confirmed) =
+            wait_for_resize(&handle, &args.name, &applied.resize_status, budget).await;
+        resized = confirmed;
+        match result {
             Ok(status) => {
                 applied.resize_status = status;
             }
@@ -253,6 +252,78 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
 
 fn resize_wait_budget(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_RESIZE_WAIT_SECS))
+}
+
+/// Wait for live resize convergence within one budget, returning whether to confirm a resize.
+///
+/// When apply reported no resize, a first read decides the confirmation and counts against the
+/// budget. A zero budget performs only that read.
+async fn wait_for_resize(
+    handle: &SandboxHandle,
+    name: &str,
+    applied: &[ResourceResizeStatus],
+    budget: Duration,
+) -> (Result<Vec<ResourceResizeStatus>, MicrosandboxError>, bool) {
+    if !applied.is_empty() {
+        let result = handle.wait_until_resized_with_timeout(budget).await;
+        return (result, true);
+    }
+
+    let started = Instant::now();
+    let first =
+        match tokio::time::timeout(first_read_deadline(budget), handle.resize_status()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => return (Err(error), false),
+            Err(_) => return (Err(resize_timeout(name, budget, Vec::new())), false),
+        };
+    let resized = confirm_resized(applied, &first);
+    if resize_settled(&first) {
+        return (Ok(first), resized);
+    }
+    let Some(remaining) = remaining_budget(budget, started.elapsed()) else {
+        return (Err(resize_timeout(name, budget, first)), resized);
+    };
+    let result = match handle.wait_until_resized_with_timeout(remaining).await {
+        Err(MicrosandboxError::ResizeTimeout { status, .. }) => Err(resize_timeout(
+            name,
+            budget,
+            timeout_resize_status(first, status),
+        )),
+        result => result,
+    };
+    (result, resized)
+}
+
+/// Deadline for the first read; a zero budget still gets one control request.
+fn first_read_deadline(budget: Duration) -> Duration {
+    if budget.is_zero() {
+        DEFAULT_REQUEST_TIMEOUT
+    } else {
+        budget
+    }
+}
+
+/// Budget left for the wait, or `None` when it is spent.
+fn remaining_budget(budget: Duration, elapsed: Duration) -> Option<Duration> {
+    budget
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+}
+
+fn resize_settled(status: &[ResourceResizeStatus]) -> bool {
+    status.iter().all(|entry| entry.state.is_terminal())
+}
+
+fn resize_timeout(
+    name: &str,
+    timeout: Duration,
+    status: Vec<ResourceResizeStatus>,
+) -> MicrosandboxError {
+    MicrosandboxError::ResizeTimeout {
+        name: name.to_string(),
+        timeout,
+        status,
+    }
 }
 
 /// Confirm a resize when this call changed CPU or memory, or one was still settling.
@@ -1050,6 +1121,49 @@ mod tests {
         )];
         assert_eq!(timeout_resize_status(applied.clone(), Vec::new()), applied);
         assert_eq!(timeout_resize_status(applied, observed.clone()), observed);
+    }
+
+    #[test]
+    fn resize_wait_shares_one_budget() {
+        let budget = Duration::from_secs(5);
+        assert_eq!(
+            remaining_budget(budget, Duration::from_secs(2)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(remaining_budget(budget, budget), None);
+        assert_eq!(remaining_budget(budget, Duration::from_secs(6)), None);
+        assert_eq!(remaining_budget(Duration::ZERO, Duration::ZERO), None);
+        assert_eq!(first_read_deadline(budget), budget);
+        assert_eq!(first_read_deadline(Duration::ZERO), DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn first_read_settles_only_when_every_resource_is_terminal() {
+        let converging = resize_entry(ResourceKind::Cpus, ResourceConvergenceState::Converging);
+        let applied = resize_entry(ResourceKind::Memory, ResourceConvergenceState::Applied);
+        let refused = resize_entry(ResourceKind::Cpus, ResourceConvergenceState::GuestRefused);
+        assert!(resize_settled(&[]));
+        assert!(resize_settled(&[applied.clone(), refused]));
+        assert!(!resize_settled(&[applied, converging]));
+    }
+
+    #[test]
+    fn resize_timeout_reports_full_budget() {
+        let status = vec![resize_entry(
+            ResourceKind::Cpus,
+            ResourceConvergenceState::Converging,
+        )];
+        let MicrosandboxError::ResizeTimeout {
+            name,
+            timeout,
+            status: reported,
+        } = resize_timeout("api", Duration::ZERO, status.clone())
+        else {
+            panic!("expected a resize timeout");
+        };
+        assert_eq!(name, "api");
+        assert_eq!(timeout, Duration::ZERO);
+        assert_eq!(reported, status);
     }
 
     #[test]

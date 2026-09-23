@@ -2852,15 +2852,23 @@ async fn identified_sandbox_handle(
     expected_id: &str,
 ) -> Result<microsandbox::sandbox::SandboxHandle, FfiError> {
     let handle = Sandbox::get(name).await.map_err(FfiError::from)?;
-    let actual_id = handle.id().to_string();
-    if actual_id != expected_id {
-        return Err(FfiError::from(MicrosandboxError::SandboxReplaced {
-            name: name.to_string(),
-            expected: expected_id.to_string(),
-            actual: actual_id,
-        }));
-    }
+    ensure_expected_identity(name, expected_id, handle.id().to_string())?;
     Ok(handle)
+}
+
+fn ensure_expected_identity(
+    name: &str,
+    expected_id: &str,
+    actual_id: String,
+) -> Result<(), FfiError> {
+    if actual_id == expected_id {
+        return Ok(());
+    }
+    Err(FfiError::from(MicrosandboxError::SandboxReplaced {
+        name: name.to_string(),
+        expected: expected_id.to_string(),
+        actual: actual_id,
+    }))
 }
 
 /// Include catalog lookup in the same deadline as graceful completion. In particular, an
@@ -3248,36 +3256,42 @@ pub unsafe extern "C" fn msb_sandbox_handle_modify(
     })
 }
 
-/// Read live resize status by name. Output: a `ResourceResizeStatus` JSON array.
+/// Read live resize status for the sandbox `expected_id` names.
+/// Output: a `ResourceResizeStatus` JSON array.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_sandbox_handle_resize_status(
     cancel_id: u64,
     name: *const c_char,
+    expected_id: *const c_char,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
         let name = unsafe { cstr(name) }?;
+        let expected_id = unsafe { cstr(expected_id) }?;
         Ok(Box::pin(async move {
-            let h = Sandbox::get(&name).await.map_err(FfiError::from)?;
+            let h = identified_sandbox_handle(&name, &expected_id).await?;
             resize_status_json(h.resize_status().await.map_err(FfiError::from)?)
         }))
     })
 }
 
-/// Wait by name for live resizes to settle. `u64::MAX` waits without a deadline; 0 checks once.
+/// Wait for live resizes on the sandbox `expected_id` names to settle.
+/// `u64::MAX` waits without a deadline; 0 checks once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn msb_sandbox_handle_wait_until_resized(
     cancel_id: u64,
     name: *const c_char,
+    expected_id: *const c_char,
     timeout_ms: u64,
     buf: *mut c_uchar,
     buf_len: usize,
 ) -> *mut c_char {
     run_c(cancel_id, buf, buf_len, || {
         let name = unsafe { cstr(name) }?;
+        let expected_id = unsafe { cstr(expected_id) }?;
         Ok(Box::pin(async move {
-            let h = Sandbox::get(&name).await.map_err(FfiError::from)?;
+            let h = identified_sandbox_handle(&name, &expected_id).await?;
             let status = match resize_wait_timeout(timeout_ms) {
                 Some(timeout) => h.wait_until_resized_with_timeout(timeout).await,
                 None => h.wait_until_resized().await,
@@ -8012,6 +8026,14 @@ mod tests {
         assert_eq!(payload["resize_status"][0]["actual"], "2");
         assert_eq!(payload["resize_status"][0]["state"], "converging");
         assert!(payload.get("recovery").is_none());
+    }
+
+    #[test]
+    fn handle_identity_mismatch_reports_replacement() {
+        assert!(ensure_expected_identity("worker", "local:42", "local:42".into()).is_ok());
+        let error = ensure_expected_identity("worker", "local:42", "local:43".into()).unwrap_err();
+        assert_eq!(error.kind, error_kind::SANDBOX_REPLACED);
+        assert!(error.message.contains("worker"));
     }
 
     #[test]

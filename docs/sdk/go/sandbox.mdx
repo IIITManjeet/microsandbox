@@ -2661,7 +2661,7 @@ Block until terminal state
 ResizeStatus(ctx)
 ```
 
-Current live CPU and memory resize status. Empty when not running.
+Current live CPU and memory resize status of this exact sandbox. Empty when not running. Returns `ErrSandboxReplaced` if the name now refers to another sandbox.
 
 <p className="msb-label">Returns</p>
 
@@ -2676,7 +2676,7 @@ WaitUntilResized(ctx)
 WaitUntilResizedWithTimeout(ctx, timeout)
 ```
 
-Wait until every live resize is terminal. Returns an empty slice when the sandbox is not running. The untimed variant keeps polling while a guest never converges; the timed variant returns a `*ResizeTimeoutError` on expiry, with the last observed status in its `Status` field.
+Wait until every live resize on this exact sandbox is terminal. Returns an empty slice when the sandbox is not running, and `ErrSandboxReplaced` if the name now refers to another sandbox. The untimed variant keeps polling while a guest never converges; the timed variant returns a `*ResizeTimeoutError` on expiry, with the last observed status in its `Status` field.
 
 <p className="msb-label">Returns</p>
 

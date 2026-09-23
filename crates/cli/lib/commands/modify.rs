@@ -213,8 +213,14 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
     }
 
     let mut applied = builder.apply().await?;
-    let resized = !applied.resize_status.is_empty();
+    let mut resized = false;
     if args.wait {
+        let before_wait = if applied.resize_status.is_empty() {
+            handle.resize_status().await?
+        } else {
+            Vec::new()
+        };
+        resized = confirm_resized(&applied.resize_status, &before_wait);
         let timeout = resize_wait_budget(args.timeout);
         match handle.wait_until_resized_with_timeout(timeout).await {
             Ok(status) => {
@@ -239,7 +245,7 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&applied)?);
     } else {
-        print_apply_success(&applied, args.wait && resized);
+        print_apply_success(&applied, resized);
     }
 
     Ok(())
@@ -247,6 +253,11 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
 
 fn resize_wait_budget(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_RESIZE_WAIT_SECS))
+}
+
+/// Confirm a resize when this call changed CPU or memory, or one was still settling.
+fn confirm_resized(applied: &[ResourceResizeStatus], before_wait: &[ResourceResizeStatus]) -> bool {
+    !applied.is_empty() || before_wait.iter().any(|status| !status.state.is_terminal())
 }
 
 /// Prefer the wait's last read, falling back to the apply status when no read completed.
@@ -552,7 +563,7 @@ fn print_apply_blocker(blocked: &ApplyBlocker) {
     ui::error_with_lines(&blocked.title, &lines);
 }
 
-fn print_apply_success(plan: &SandboxModificationPlan, waited: bool) {
+fn print_apply_success(plan: &SandboxModificationPlan, resized: bool) {
     if plan.policy == microsandbox::sandbox::ModificationPolicy::Restart
         && plan_has_restart_required(plan)
     {
@@ -570,7 +581,7 @@ fn print_apply_success(plan: &SandboxModificationPlan, waited: bool) {
         ui::success("Modified", &target);
     }
 
-    if waited && !plan.resize_status.is_empty() {
+    if resized && !plan.resize_status.is_empty() {
         ui::success("Resized", &plan.sandbox);
     }
 
@@ -1039,6 +1050,16 @@ mod tests {
         )];
         assert_eq!(timeout_resize_status(applied.clone(), Vec::new()), applied);
         assert_eq!(timeout_resize_status(applied, observed.clone()), observed);
+    }
+
+    #[test]
+    fn resized_confirmation_tracks_changed_or_pending_resizes() {
+        let converging = resize_entry(ResourceKind::Cpus, ResourceConvergenceState::Converging);
+        let applied = resize_entry(ResourceKind::Memory, ResourceConvergenceState::Applied);
+        assert!(confirm_resized(std::slice::from_ref(&applied), &[]));
+        assert!(confirm_resized(&[], &[applied.clone(), converging]));
+        assert!(!confirm_resized(&[], &[applied]));
+        assert!(!confirm_resized(&[], &[]));
     }
 
     #[test]

@@ -119,8 +119,8 @@ typedef char *(*msb_sandbox_handle_wait_until_stopped_fn)(uint64_t cancel_id, co
 typedef char *(*msb_sandbox_handle_ping_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_handle_touch_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_handle_modify_fn)(uint64_t cancel_id, const char *name, const char *opts_json, uint8_t *buf, size_t buf_len);
-typedef char *(*msb_sandbox_handle_resize_status_fn)(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len);
-typedef char *(*msb_sandbox_handle_wait_until_resized_fn)(uint64_t cancel_id, const char *name, uint64_t timeout_ms, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_handle_resize_status_fn)(uint64_t cancel_id, const char *name, const char *expected_id, uint8_t *buf, size_t buf_len);
+typedef char *(*msb_sandbox_handle_wait_until_resized_fn)(uint64_t cancel_id, const char *name, const char *expected_id, uint64_t timeout_ms, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_close_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_detach_fn)(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len);
 typedef char *(*msb_sandbox_stop_fn)(uint64_t cancel_id, uint64_t handle, uint64_t timeout_ms, uint8_t *buf, size_t buf_len);
@@ -728,11 +728,11 @@ bool has_resize_wait(void) {
 	return ptr_msb_sandbox_handle_resize_status && ptr_msb_sandbox_handle_wait_until_resized
 		&& ptr_msb_sandbox_resize_status && ptr_msb_sandbox_wait_until_resized;
 }
-char *call_msb_sandbox_handle_resize_status(uint64_t cancel_id, const char *name, uint8_t *buf, size_t buf_len) {
-	return ptr_msb_sandbox_handle_resize_status ? ptr_msb_sandbox_handle_resize_status(cancel_id, name, buf, buf_len) : NULL;
+char *call_msb_sandbox_handle_resize_status(uint64_t cancel_id, const char *name, const char *expected_id, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_handle_resize_status ? ptr_msb_sandbox_handle_resize_status(cancel_id, name, expected_id, buf, buf_len) : NULL;
 }
-char *call_msb_sandbox_handle_wait_until_resized(uint64_t cancel_id, const char *name, uint64_t timeout_ms, uint8_t *buf, size_t buf_len) {
-	return ptr_msb_sandbox_handle_wait_until_resized ? ptr_msb_sandbox_handle_wait_until_resized(cancel_id, name, timeout_ms, buf, buf_len) : NULL;
+char *call_msb_sandbox_handle_wait_until_resized(uint64_t cancel_id, const char *name, const char *expected_id, uint64_t timeout_ms, uint8_t *buf, size_t buf_len) {
+	return ptr_msb_sandbox_handle_wait_until_resized ? ptr_msb_sandbox_handle_wait_until_resized(cancel_id, name, expected_id, timeout_ms, buf, buf_len) : NULL;
 }
 char *call_msb_sandbox_close(uint64_t cancel_id, uint64_t handle, uint8_t *buf, size_t buf_len) {
 	return ptr_msb_sandbox_close ? ptr_msb_sandbox_close(cancel_id, handle, buf, buf_len) : NULL;
@@ -2651,8 +2651,9 @@ func ModifySandboxByName(ctx context.Context, name, optsJSON string) (string, er
 	})
 }
 
-// ResizeStatusSandboxByName returns the raw live resize status JSON array.
-func ResizeStatusSandboxByName(ctx context.Context, name string) (string, error) {
+// ResizeStatusSandboxByName returns the raw live resize status JSON array
+// for the sandbox named name whose identity is id.
+func ResizeStatusSandboxByName(ctx context.Context, name, id string) (string, error) {
 	if err := ensureLoaded(); err != nil {
 		return "", err
 	}
@@ -2661,13 +2662,16 @@ func ResizeStatusSandboxByName(ctx context.Context, name string) (string, error)
 	}
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
+	cID := C.CString(id)
+	defer C.free(unsafe.Pointer(cID))
 	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
-		return C.call_msb_sandbox_handle_resize_status(cancelID, cName, buf, bufLen)
+		return C.call_msb_sandbox_handle_resize_status(cancelID, cName, cID, buf, bufLen)
 	})
 }
 
-// WaitUntilResizedSandboxByName waits for live resizes to settle within timeoutMs.
-func WaitUntilResizedSandboxByName(ctx context.Context, name string, timeoutMs uint64) (string, error) {
+// WaitUntilResizedSandboxByName waits for live resizes on the sandbox named
+// name whose identity is id to settle within timeoutMs.
+func WaitUntilResizedSandboxByName(ctx context.Context, name, id string, timeoutMs uint64) (string, error) {
 	if err := ensureLoaded(); err != nil {
 		return "", err
 	}
@@ -2676,8 +2680,10 @@ func WaitUntilResizedSandboxByName(ctx context.Context, name string, timeoutMs u
 	}
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
+	cID := C.CString(id)
+	defer C.free(unsafe.Pointer(cID))
 	return call(ctx, func(cancelID C.uint64_t, buf *C.uint8_t, bufLen C.size_t) *C.char {
-		return C.call_msb_sandbox_handle_wait_until_resized(cancelID, cName, C.uint64_t(timeoutMs), buf, bufLen)
+		return C.call_msb_sandbox_handle_wait_until_resized(cancelID, cName, cID, C.uint64_t(timeoutMs), buf, bufLen)
 	})
 }
 

@@ -318,23 +318,13 @@ impl SandboxModificationBuilder {
         );
 
         validate_apply_supported(&plan)?;
-        if let Some(local) = handle.local() {
-            // Refuse an unrepresentable persisted change before stopping a VM,
+        if handle.local().is_some() {
+            // Validate configuration serialization before stopping a VM,
             // growing a disk, or issuing any live control mutation.
             let mut prospective = config.clone();
             apply_patch_to_config(&mut prospective, &self.patch);
             apply_secret_patch_to_config(&mut prospective, &self.patch)?;
-            let backend = self
-                .backend
-                .as_local()
-                .ok_or_else(|| crate::MicrosandboxError::local_only(Operation::SandboxModify))?;
-            crate::db::writing::encode_existing(
-                backend.db().await?.read(),
-                &prospective,
-                &local.config_json,
-                Some(backend.config()),
-            )
-            .await?;
+            serde_json::to_string(&prospective)?;
         }
         let restart_required = plan_requires_restart(&plan) && running_status(status);
         if restart_required {
@@ -1695,13 +1685,7 @@ async fn persist_config(
 
     let labels = config.spec.labels.clone();
     let write_db = local_backend.db().await?.write();
-    let config_json = crate::db::writing::encode_existing(
-        write_db,
-        config,
-        &local.config_json,
-        Some(local_backend.config()),
-    )
-    .await?;
+    let config_json = serde_json::to_string(config)?;
 
     write_db
         .transaction(|txn| {
@@ -1754,7 +1738,6 @@ async fn persist_active_config(
             local_backend.db().await?.write(),
             expected.as_deref(),
             active,
-            Some(local_backend.config()),
         )
         .await?;
     *expected = Some(json);

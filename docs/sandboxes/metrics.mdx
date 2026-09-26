@@ -118,7 +118,7 @@ Fleet snapshots only include sandboxes whose runtime process is actually alive. 
 
 Memory limits follow live memory resizes on current runtimes: per-sandbox metrics, metrics reports, `msb metrics`, fleet snapshots, and `msb-metrics` all report the guest's current memory size. For sandboxes started by an older runtime, per-sandbox metrics and reports fall back to the configured size, while fleet snapshots and `msb-metrics` report the boot allocation until the sandbox is restarted.
 
-Memory usage is the guest memory in use, measured against the live memory size when the runtime reports it. Right after a resize, usage can briefly be off until the guest's memory statistics catch up.
+Memory usage is the guest memory in use, measured against the live memory size when the runtime reports it. Right after a resize, usage can briefly be off or missing until the guest's memory statistics catch up.
 
 ## Metrics reports (Rust)
 

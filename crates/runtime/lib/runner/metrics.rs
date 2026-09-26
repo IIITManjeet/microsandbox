@@ -290,9 +290,11 @@ fn live_memory_limit_bytes(state: Option<&msb_krun::VmMemoryState>) -> Option<u6
     state.map(|state| state.current_mib.saturating_mul(BYTES_PER_MIB))
 }
 
+/// Guest memory in use against the live limit. Unavailable while the guest's
+/// available-memory statistic still exceeds a limit that just shrank.
 fn live_memory_used_bytes(krun: &msb_krun::VmMetrics, limit_bytes: Option<u64>) -> Option<u64> {
     match (limit_bytes, krun.memory.available_bytes) {
-        (Some(limit), Some(available)) => Some(limit.saturating_sub(available)),
+        (Some(limit), Some(available)) => limit.checked_sub(available),
         _ => krun.memory.used_bytes,
     }
 }
@@ -646,7 +648,7 @@ mod tests {
         assert_eq!(live_memory_used_bytes(&krun, None), Some(6 * GIB));
 
         let krun = krun_memory(Some(0), Some(4 * GIB));
-        assert_eq!(live_memory_used_bytes(&krun, Some(2 * GIB)), Some(0));
+        assert_eq!(live_memory_used_bytes(&krun, Some(2 * GIB)), None);
     }
 
     #[test]

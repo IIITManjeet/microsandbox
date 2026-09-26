@@ -143,9 +143,9 @@ Disk and network totals are gauges containing absolute cumulative values. Use
 
 During a memory resize, `memory.limit` tracks plugged memory and converges to the
 accepted target as the guest plugs or releases memory. Right after a resize,
-`memory.usage` can briefly be off until the guest's memory statistics catch
-up. Sandboxes started by an older runtime keep reporting their boot allocation
-until they are restarted.
+`memory.usage` can briefly be off or missing until the guest's memory statistics
+catch up. Sandboxes started by an older runtime keep reporting their boot
+allocation until they are restarted.
 
 ### Attributes
 

@@ -136,7 +136,7 @@ impl Default for IdentityAttributes {
 #[derive(Clone, Debug)]
 struct SandboxMetricObservation {
     cpu_utilization: f64,
-    memory_usage: u64,
+    memory_usage: Option<u64>,
     memory_limit: u64,
     memory_host_resident: Option<u64>,
     disk_bytes_read: u64,
@@ -649,7 +649,9 @@ fn register_sandbox_instruments(meter: &Meter) -> SandboxMetricObservations {
         .with_callback(move |observer| {
             memory_usage_observations.with_observations(|observations| {
                 for observation in observations {
-                    observer.observe(observation.memory_usage, &observation.attrs);
+                    if let Some(value) = observation.memory_usage {
+                        observer.observe(value, &observation.attrs);
+                    }
                 }
             });
         })
@@ -830,7 +832,7 @@ fn build_observation(
     // for `*.utilization` is a 0..1 ratio.
     SandboxMetricObservation {
         cpu_utilization: f64::from(m.cpu_percent) / 100.0,
-        memory_usage: m.memory_bytes,
+        memory_usage: m.memory_bytes_reported.then_some(m.memory_bytes),
         memory_limit: m.memory_limit_bytes,
         memory_host_resident: m.memory_host_resident_bytes,
         disk_bytes_read: m.disk_read_bytes,
@@ -868,6 +870,7 @@ mod tests {
                 cpu_percent: 1.0,
                 vcpu_time_ns: 1,
                 memory_bytes: 1,
+                memory_bytes_reported: true,
                 memory_available_bytes: Some(2),
                 memory_host_resident_bytes: Some(3),
                 memory_limit_bytes: 2,
@@ -997,6 +1000,32 @@ mod tests {
             metric_point_count(&without_upper, "microsandbox.upper.host_allocated"),
             0
         );
+    }
+
+    #[test]
+    fn memory_usage_is_skipped_when_unreported() {
+        let (_provider, reader, observations) = test_reader();
+        let current = snapshot();
+        let attrs = build_attributes(&current, &IdentityAttributes::default(), None);
+
+        observations.replace(vec![build_observation(&current, attrs)]);
+        let mut reported = ResourceMetrics::default();
+        reader.collect(&mut reported).expect("collect with usage");
+        assert_eq!(
+            metric_point_count(&reported, "microsandbox.memory.usage"),
+            1
+        );
+
+        let mut unreported = snapshot();
+        unreported.metrics.memory_bytes = 0;
+        unreported.metrics.memory_bytes_reported = false;
+        let attrs = build_attributes(&unreported, &IdentityAttributes::default(), None);
+        observations.replace(vec![build_observation(&unreported, attrs)]);
+
+        let mut skipped = ResourceMetrics::default();
+        reader.collect(&mut skipped).expect("collect without usage");
+        assert_eq!(metric_point_count(&skipped, "microsandbox.memory.usage"), 0);
+        assert_eq!(metric_point_count(&skipped, "microsandbox.memory.limit"), 1);
     }
 
     #[test]

@@ -506,6 +506,7 @@ mod tests {
             cpu_percent: 0.0,
             vcpu_time_ns: 0,
             memory_bytes: 128 * MIB,
+            memory_bytes_reported: true,
             memory_available_bytes: None,
             memory_host_resident_bytes: None,
             memory_limit_bytes,

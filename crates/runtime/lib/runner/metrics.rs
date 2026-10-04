@@ -754,6 +754,25 @@ mod tests {
         assert_eq!(snapshot[0].memory_limit_bytes, 1_024 * 1024 * 1024);
         assert!(snapshot[0].memory_limit_live);
         assert_eq!(snapshot[0].memory_bytes, 768 * 1024 * 1024);
+        assert!(snapshot[0].memory_bytes_reported);
+
+        let krun = krun_memory(Some(0), Some(2_048 * 1024 * 1024));
+        assert!(
+            write_sample(
+                &writer,
+                None,
+                &krun,
+                Some(memory_state_mib(512, 512, 1_024)),
+                None,
+                None,
+                Duration::from_secs(3),
+            )
+            .is_ok()
+        );
+
+        let snapshot = registry.snapshot().unwrap();
+        assert_eq!(snapshot[0].memory_bytes, 0);
+        assert!(!snapshot[0].memory_bytes_reported);
         cleanup_shm(&name);
     }
 

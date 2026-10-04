@@ -787,6 +787,7 @@ impl MetricsRegistry {
                 cpu_percent: f32::from_bits(cpu_bits),
                 vcpu_time_ns,
                 memory_bytes: memory,
+                memory_bytes_reported: flag_set(sample_flags, SAMPLE_FLAG_MEMORY_USED),
                 memory_available_bytes: flag_value(
                     sample_flags,
                     SAMPLE_FLAG_MEMORY_AVAILABLE,
@@ -1400,7 +1401,7 @@ pub(crate) fn flag_value(flags: u32, flag: u32, value: u64) -> Option<u64> {
     }
 }
 
-fn flag_set(flags: u32, flag: u32) -> bool {
+pub(crate) fn flag_set(flags: u32, flag: u32) -> bool {
     flags & flag == flag
 }
 
@@ -2320,6 +2321,7 @@ mod tests {
         assert_eq!(live.cpu_percent, 0.0);
         assert_eq!(live.vcpu_time_ns, 0);
         assert_eq!(live.memory_bytes, 0);
+        assert!(!live.memory_bytes_reported);
         assert_eq!(live.memory_available_bytes, Some(1));
         assert_eq!(live.memory_host_resident_bytes, Some(1));
         assert_eq!(live.disk_read_bytes, 1);

@@ -855,7 +855,10 @@ fn build_observation(
 mod tests {
     use std::time::Duration;
 
-    use microsandbox_metrics::SandboxMetrics;
+    use microsandbox_metrics::{
+        ActivateSlot, MetricsRegistry, MetricsRegistryReader, REGISTRY_ABI_VERSION, ReserveSlot,
+        SampleWrite, SandboxMetrics,
+    };
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 
     use super::*;
@@ -1003,29 +1006,94 @@ mod tests {
     }
 
     #[test]
-    fn memory_usage_is_skipped_when_unreported() {
-        let (_provider, reader, observations) = test_reader();
-        let current = snapshot();
-        let attrs = build_attributes(&current, &IdentityAttributes::default(), None);
-
-        observations.replace(vec![build_observation(&current, attrs)]);
-        let mut reported = ResourceMetrics::default();
-        reader.collect(&mut reported).expect("collect with usage");
-        assert_eq!(
-            metric_point_count(&reported, "microsandbox.memory.usage"),
-            1
+    fn registry_memory_usage_omits_missing_samples_and_recovers_with_zero() {
+        let name = format!(
+            "/msb-usage-{:x}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
         );
+        let registry = MetricsRegistry::open_or_create(&name, 1).unwrap();
+        let reserved = registry
+            .reserve(ReserveSlot {
+                sandbox_id: 7,
+                name: "resize",
+                memory_limit_bytes: 512 * 1024 * 1024,
+            })
+            .unwrap();
+        let writer = registry
+            .activate_writer(ActivateSlot {
+                slot: reserved.slot,
+                generation: reserved.generation,
+                run_id: 70,
+                pid: std::process::id() as i32,
+                started_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        let registry_reader = MetricsRegistryReader::open(&name, REGISTRY_ABI_VERSION).unwrap();
 
-        let mut unreported = snapshot();
-        unreported.metrics.memory_bytes = 0;
-        unreported.metrics.memory_bytes_reported = false;
-        let attrs = build_attributes(&unreported, &IdentityAttributes::default(), None);
-        observations.replace(vec![build_observation(&unreported, attrs)]);
+        // Keep the mappings alive but remove the Unix name, including on assertion failure.
+        #[cfg(unix)]
+        unsafe {
+            libc::shm_unlink(std::ffi::CString::new(name).unwrap().as_ptr());
+        }
 
-        let mut skipped = ResourceMetrics::default();
-        reader.collect(&mut skipped).expect("collect without usage");
-        assert_eq!(metric_point_count(&skipped, "microsandbox.memory.usage"), 0);
-        assert_eq!(metric_point_count(&skipped, "microsandbox.memory.limit"), 1);
+        let (_provider, reader, observations) = test_reader();
+
+        for (used, limit) in [
+            (Some(128 * 1024 * 1024), 1_024 * 1024 * 1024),
+            (None, 512 * 1024 * 1024),
+            (Some(0), 512 * 1024 * 1024),
+        ] {
+            writer
+                .write_sample(SampleWrite {
+                    sampled_at: chrono::Utc::now(),
+                    cpu_percent: Some(0.0),
+                    vcpu_time_ns: Some(1),
+                    memory_bytes: used,
+                    memory_available_bytes: Some(
+                        used.map_or(768 * 1024 * 1024, |used| limit - used),
+                    ),
+                    memory_host_resident_bytes: None,
+                    memory_limit_bytes: Some(limit),
+                    disk_read_bytes: 0,
+                    disk_write_bytes: 0,
+                    net_rx_bytes: 0,
+                    net_tx_bytes: 0,
+                    upper_used_bytes: None,
+                    upper_free_bytes: None,
+                    upper_host_allocated_bytes: None,
+                })
+                .unwrap();
+
+            let current =
+                SandboxMetricSnapshot::from(registry_reader.active_snapshot().unwrap().remove(0));
+            let attrs = build_attributes(&current, &IdentityAttributes::default(), None);
+            observations.replace(vec![build_observation(&current, attrs)]);
+            let mut exported = ResourceMetrics::default();
+            reader.collect(&mut exported).unwrap();
+
+            for (name, expected) in [
+                (
+                    "microsandbox.memory.usage",
+                    used.into_iter().collect::<Vec<_>>(),
+                ),
+                ("microsandbox.memory.limit", vec![limit]),
+            ] {
+                let values: Vec<_> = exported
+                    .scope_metrics()
+                    .flat_map(|scope| scope.metrics())
+                    .filter(|metric| metric.name() == name)
+                    .flat_map(|metric| match metric.data() {
+                        AggregatedMetrics::U64(MetricData::Gauge(gauge)) => gauge
+                            .data_points()
+                            .map(|point| point.value())
+                            .collect::<Vec<_>>(),
+                        _ => panic!("{name} should be a u64 gauge"),
+                    })
+                    .collect();
+
+                assert_eq!(values, expected, "{name}");
+            }
+        }
     }
 
     #[test]

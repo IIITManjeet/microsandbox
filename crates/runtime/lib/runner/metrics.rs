@@ -36,8 +36,6 @@ const MIN_UPPER_FILESYSTEM_STALE_AFTER: Duration = Duration::from_secs(3);
 /// sampler was descheduled mid-read and the window's ratio is unusable.
 const MAX_PAIRING_SKEW_RATIO: f64 = 0.05;
 
-const BYTES_PER_MIB: u64 = 1024 * 1024;
-
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -86,14 +84,12 @@ pub struct MetricsSamplerSpec {
     pub max_cpus: u8,
     /// VMM metrics source.
     pub krun_metrics: msb_krun::MetricsHandle,
-    /// VM execution state used to omit expensive residency scans while paused.
+    /// VM control for live memory size and pause-aware residency sampling.
     pub vm_control: msb_krun::VmControl,
     /// Optional runtime network byte counters.
     pub network_metrics: Option<Box<dyn NetworkMetrics>>,
     /// Host path of the writable upper image, when one exists.
     pub upper_host_path: Option<std::path::PathBuf>,
-    /// Live VM control used to read the current guest memory size.
-    pub memory_control: Option<msb_krun::VmControl>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -113,7 +109,6 @@ pub async fn run_metrics_sampler(spec: MetricsSamplerSpec) {
         vm_control,
         network_metrics,
         upper_host_path,
-        memory_control,
     } = spec;
     let interval = Duration::from_millis(interval_ms.get());
     let upper_stale_after = upper_filesystem_stale_after(interval);
@@ -125,7 +120,7 @@ pub async fn run_metrics_sampler(spec: MetricsSamplerSpec) {
         &writer,
         None,
         &previous.metrics,
-        memory_state(memory_control.as_ref()),
+        vm_control.memory_state(),
         network_metrics.as_deref(),
         upper_host_path,
         upper_stale_after,
@@ -187,7 +182,7 @@ pub async fn run_metrics_sampler(spec: MetricsSamplerSpec) {
             &writer,
             cpu_percent,
             &current.metrics,
-            memory_state(memory_control.as_ref()),
+            vm_control.memory_state(),
             network_metrics.as_deref(),
             upper_host_path,
             upper_stale_after,
@@ -298,13 +293,9 @@ fn write_sample(
     }
 }
 
-fn memory_state(control: Option<&msb_krun::VmControl>) -> Option<msb_krun::VmMemoryState> {
-    control.and_then(|control| control.memory_state())
-}
-
 /// Guest memory currently usable by the VM, boot plus plugged.
 fn live_memory_limit_bytes(state: Option<&msb_krun::VmMemoryState>) -> Option<u64> {
-    state.map(|state| state.current_mib.saturating_mul(BYTES_PER_MIB))
+    state.map(|state| state.current_mib.saturating_mul(1024 * 1024))
 }
 
 /// Guest memory in use against the live limit. Unavailable while the guest's
@@ -773,6 +764,28 @@ mod tests {
         let snapshot = registry.snapshot().unwrap();
         assert_eq!(snapshot[0].memory_bytes, 0);
         assert!(!snapshot[0].memory_bytes_reported);
+        assert_eq!(snapshot[0].memory_limit_bytes, 1_024 * 1024 * 1024);
+        assert!(snapshot[0].memory_limit_live);
+
+        // The limit remains usable even before guest memory statistics arrive.
+        let krun = krun_memory(None, None);
+        assert!(
+            write_sample(
+                &writer,
+                None,
+                &krun,
+                Some(memory_state_mib(512, 2_048, 2_048)),
+                None,
+                None,
+                Duration::from_secs(3),
+            )
+            .is_ok()
+        );
+
+        let snapshot = registry.snapshot().unwrap();
+        assert!(!snapshot[0].memory_bytes_reported);
+        assert_eq!(snapshot[0].memory_limit_bytes, 2_048 * 1024 * 1024);
+        assert!(snapshot[0].memory_limit_live);
         cleanup_shm(&name);
     }
 

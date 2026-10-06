@@ -403,7 +403,8 @@ fn to_sandbox_metrics(live: &LiveMetric, config: Option<&SandboxConfig>) -> Sand
     }
 }
 
-/// Older runtimes never refresh the slot limit, so the catalog config wins for them.
+/// Older runtimes and VMs without memory hotplug do not refresh the slot limit,
+/// so the catalog config wins for them.
 #[cfg(feature = "local")]
 fn resolve_memory_limit_bytes(live: &LiveMetric, config: Option<&SandboxConfig>) -> u64 {
     if live.memory_limit_live {

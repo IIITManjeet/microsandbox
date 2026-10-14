@@ -324,7 +324,8 @@ impl SandboxHandle {
 
     /// Read the current live CPU and memory resize status.
     ///
-    /// Returns an empty list when the sandbox is not running.
+    /// Returns an empty list when the sandbox is not running, and
+    /// `Unsupported` when its runtime cannot report resize status.
     #[cfg(feature = "local")]
     pub async fn resize_status(&self) -> MicrosandboxResult<Vec<ResourceResizeStatus>> {
         super::resize::resize_status(&self.backend, &self.name, &self.identity()).await
@@ -332,7 +333,8 @@ impl SandboxHandle {
 
     /// Wait until every live resize reaches a terminal state.
     ///
-    /// Returns an empty list when the sandbox is not running. Keeps polling
+    /// Returns an empty list when the sandbox is not running, and
+    /// `Unsupported` when its runtime cannot report resize status. Keeps polling
     /// while a guest never converges; use `wait_until_resized_with_timeout` to
     /// bound the wait.
     #[cfg(feature = "local")]
@@ -342,7 +344,8 @@ impl SandboxHandle {
 
     /// Wait until every live resize reaches a terminal state within `timeout`.
     ///
-    /// Returns an empty list when the sandbox is not running. Expiry returns
+    /// Returns an empty list when the sandbox is not running, and
+    /// `Unsupported` when its runtime cannot report resize status. Expiry returns
     /// [`MicrosandboxError::ResizeTimeout`] with the last observed status, which is empty when no read
     /// completed before the deadline.
     #[cfg(feature = "local")]

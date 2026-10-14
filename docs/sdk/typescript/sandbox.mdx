@@ -872,7 +872,7 @@ Block until the sandbox is observed in a terminal non-running state, without tri
 resizeStatus(): Promise<ResourceResizeStatus[]>
 ```
 
-Read the current live CPU and memory resize status without changing anything. Returns an empty array when the sandbox is not running.
+Read the current live CPU and memory resize status without changing anything. Returns an empty array when the sandbox is not running, and fails with `UnsupportedOperationError` when a running sandbox's runtime cannot report resize status.
 
 #### <span className="msb-recv">sandbox.</span><span className="msb-hn">waitUntilResized()</span>
 
@@ -882,7 +882,7 @@ Read the current live CPU and memory resize status without changing anything. Re
 waitUntilResized(timeoutMs?: number): Promise<ResourceResizeStatus[]>
 ```
 
-Wait until every resource is `"applied"`, `"guest-refused"`, or `"failed"`, and return the settled status. Returns an empty array when the sandbox is not running. Without a timeout a guest that never converges keeps this polling. On timeout, `ResizeTimeoutError.status` holds the last observed status, empty if no read completed before the deadline. The host still enforces the new limit if the wait times out.
+Wait until every resource is `"applied"`, `"guest-refused"`, or `"failed"`, and return the settled status. Returns an empty array when the sandbox is not running, and fails with `UnsupportedOperationError` when a running sandbox's runtime cannot report resize status. Without a timeout a guest that never converges keeps this polling. On timeout, `ResizeTimeoutError.status` holds the last observed status, empty if no read completed before the deadline. The host still enforces the new limit if the wait times out.
 
 <p className="msb-label">Parameters</p>
 
@@ -2755,7 +2755,7 @@ Current live CPU and memory resize status. Empty when not running.
 waitUntilResized(timeoutMs?)
 ```
 
-Wait until every live resize is terminal. Returns an empty array when the sandbox is not running. Omitted waits indefinitely, even while a guest never converges, and `0` checks once; expiry throws `ResizeTimeoutError` with the last observed `status`.
+Wait until every live resize is terminal. Returns an empty array when the sandbox is not running, and fails with `UnsupportedOperationError` when a running sandbox's runtime cannot report resize status. Omitted waits indefinitely, even while a guest never converges, and `0` checks once; expiry throws `ResizeTimeoutError` with the last observed `status`.
 
 <p className="msb-label">Returns</p>
 

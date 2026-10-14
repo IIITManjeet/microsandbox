@@ -799,7 +799,7 @@ Block until the sandbox is observed in a terminal non-running state. Owned local
 async fn resize_status(&self) -> MicrosandboxResult<Vec<ResourceResizeStatus>>
 ```
 
-Read the current live CPU and memory resize status without changing anything. Returns an empty list when the sandbox is not running.
+Read the current live CPU and memory resize status without changing anything. Returns an empty list when the sandbox is not running, and fails with `MicrosandboxError::Unsupported` when a running sandbox's runtime cannot report resize status.
 
 <p className="msb-label">Returns</p>
 
@@ -818,7 +818,7 @@ Read the current live CPU and memory resize status without changing anything. Re
 async fn wait_until_resized(&self) -> MicrosandboxResult<Vec<ResourceResizeStatus>>
 ```
 
-Wait until every resource reaches `Applied`, `GuestRefused`, or `Failed`. Returns an empty list when the sandbox is not running. There is no deadline; a guest that never converges keeps this polling, so use [`wait_until_resized_with_timeout()`](#sb-wait_until_resized_with_timeout) to bound it.
+Wait until every resource reaches `Applied`, `GuestRefused`, or `Failed`. Returns an empty list when the sandbox is not running, and fails with `MicrosandboxError::Unsupported` when a running sandbox's runtime cannot report resize status. There is no deadline; a guest that never converges keeps this polling, so use [`wait_until_resized_with_timeout()`](#sb-wait_until_resized_with_timeout) to bound it.
 
 <p className="msb-label">Returns</p>
 
@@ -2914,7 +2914,7 @@ wait_until_resized()
 wait_until_resized_with_timeout(timeout)
 ```
 
-Wait until every live resize is terminal. Returns an empty list when the sandbox is not running. The untimed variant keeps polling while a guest never converges; the timed variant returns `MicrosandboxError::ResizeTimeout` on expiry.
+Wait until every live resize is terminal. Returns an empty list when the sandbox is not running, and fails with `MicrosandboxError::Unsupported` when a running sandbox's runtime cannot report resize status. The untimed variant keeps polling while a guest never converges; the timed variant returns `MicrosandboxError::ResizeTimeout` on expiry.
 
 <p className="msb-label">Returns</p>
 

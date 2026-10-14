@@ -282,6 +282,7 @@ async fn wait_for_resize(
     let first =
         match tokio::time::timeout(first_read_deadline(budget), handle.resize_status()).await {
             Ok(Ok(status)) => status,
+            Ok(Err(MicrosandboxError::Unsupported { .. })) => return (Ok(Vec::new()), false),
             Ok(Err(error)) => return (Err(error), false),
             Err(_) => return (Err(resize_timeout(name, budget, Vec::new())), false),
         };

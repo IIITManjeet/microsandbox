@@ -976,7 +976,7 @@ Block until the sandbox is observed in a terminal state, then return how it ende
 func (s *Sandbox) ResizeStatus(ctx context.Context) ([]ResourceResizeStatus, error)
 ```
 
-Read the current live CPU and memory resize status without changing anything. Returns an empty slice when the sandbox is not running.
+Read the current live CPU and memory resize status without changing anything. Returns an empty slice when the sandbox is not running, and fails with `ErrUnsupportedOperation` when a running sandbox's runtime cannot report resize status.
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">WaitUntilResized()</span>
 
@@ -986,7 +986,7 @@ Read the current live CPU and memory resize status without changing anything. Re
 func (s *Sandbox) WaitUntilResized(ctx context.Context) ([]ResourceResizeStatus, error)
 ```
 
-Wait until every resource is `"applied"`, `"guest-refused"`, or `"failed"`. Returns an empty slice when the sandbox is not running. There is no built-in deadline and a guest that never converges keeps this polling; cancel `ctx` or use [`WaitUntilResizedWithTimeout`](#sb-waituntilresizedwithtimeout) to bound it.
+Wait until every resource is `"applied"`, `"guest-refused"`, or `"failed"`. Returns an empty slice when the sandbox is not running, and fails with `ErrUnsupportedOperation` when a running sandbox's runtime cannot report resize status. There is no built-in deadline and a guest that never converges keeps this polling; cancel `ctx` or use [`WaitUntilResizedWithTimeout`](#sb-waituntilresizedwithtimeout) to bound it.
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">WaitUntilResizedWithTimeout()</span>
 

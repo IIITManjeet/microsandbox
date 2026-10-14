@@ -9,7 +9,7 @@ use microsandbox_types::modify::{ResourceConvergenceState, ResourceKind, Resourc
 use tokio::time::Instant;
 
 use crate::backend::{Backend, ControlSession, sandbox::SandboxIdentity};
-use crate::error::Operation;
+use crate::error::{Operation, UnsupportedReason};
 use crate::{MicrosandboxError, MicrosandboxResult};
 
 use super::SandboxId;
@@ -25,7 +25,7 @@ const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Read live resize status. Empty when the sandbox is not running or has no resize control.
+/// Read live resize status. Empty when the sandbox is not running.
 pub(crate) async fn resize_status(
     backend: &Arc<dyn Backend>,
     name: &str,
@@ -127,7 +127,25 @@ async fn open_session(
     let local = backend
         .as_local()
         .ok_or_else(|| MicrosandboxError::local_only(Operation::SandboxModify))?;
-    local.control_session(name).await
+    let session = local
+        .control_session(name)
+        .await?
+        .ok_or_else(resize_status_unsupported)?;
+    let caps = session.capabilities();
+    if !caps.cpu_resize && !caps.memory_resize {
+        return Err(resize_status_unsupported());
+    }
+    Ok(Some(session))
+}
+
+fn resize_status_unsupported() -> MicrosandboxError {
+    MicrosandboxError::unsupported(
+        Operation::SandboxModify,
+        UnsupportedReason::NotAvailable(
+            "this running sandbox does not report live resize status; restart it with an updated runtime"
+                .into(),
+        ),
+    )
 }
 
 async fn read_checked(

@@ -2968,6 +2968,43 @@ where
     .map_err(|_| expired())?
 }
 
+/// Bound lookup and wait by one deadline. Zero checks once.
+async fn wait_identified_until_resized(
+    name: &str,
+    expected_id: &str,
+    timeout: Option<Duration>,
+) -> Result<Vec<microsandbox::sandbox::ResourceResizeStatus>, FfiError> {
+    let Some(timeout) = timeout.filter(|timeout| !timeout.is_zero()) else {
+        let handle = identified_sandbox_handle(name, expected_id).await?;
+        let status = match timeout {
+            Some(timeout) => handle.wait_until_resized_with_timeout(timeout).await,
+            None => handle.wait_until_resized().await,
+        };
+        return status.map_err(FfiError::from);
+    };
+    let started = tokio::time::Instant::now();
+    let expired = |status| {
+        FfiError::from(MicrosandboxError::ResizeTimeout {
+            name: name.to_string(),
+            timeout,
+            status,
+        })
+    };
+    let handle = tokio::time::timeout(timeout, identified_sandbox_handle(name, expected_id))
+        .await
+        .map_err(|_| expired(Vec::new()))??;
+    let Some(remaining) = timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+    else {
+        return Err(expired(Vec::new()));
+    };
+    match handle.wait_until_resized_with_timeout(remaining).await {
+        Err(MicrosandboxError::ResizeTimeout { status, .. }) => Err(expired(status)),
+        result => result.map_err(FfiError::from),
+    }
+}
+
 fn registered_sandbox_json(sandbox: Sandbox) -> Result<String, FfiError> {
     let backend_kind = sandbox.backend_kind().as_str();
     let id = sandbox.id().to_string();
@@ -3358,12 +3395,9 @@ pub unsafe extern "C" fn msb_sandbox_handle_wait_until_resized(
         let name = unsafe { cstr(name) }?;
         let expected_id = unsafe { cstr(expected_id) }?;
         Ok(Box::pin(async move {
-            let h = identified_sandbox_handle(&name, &expected_id).await?;
-            let status = match resize_wait_timeout(timeout_ms) {
-                Some(timeout) => h.wait_until_resized_with_timeout(timeout).await,
-                None => h.wait_until_resized().await,
-            }
-            .map_err(FfiError::from)?;
+            let status =
+                wait_identified_until_resized(&name, &expected_id, resize_wait_timeout(timeout_ms))
+                    .await?;
             resize_status_json(status)
         }))
     })

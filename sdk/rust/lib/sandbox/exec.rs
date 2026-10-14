@@ -1,16 +1,26 @@
 //! Execution types for running commands inside sandboxes.
 
-use std::{sync::Arc, time::Duration};
+mod input;
+mod output;
+
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use microsandbox_protocol::{
     exec::{ExecResize, ExecSignal, ExecStdin},
     message::MessageType,
 };
-use tokio::sync::mpsc;
 
-use crate::{MicrosandboxResult, agent::AgentClient};
+use crate::{MicrosandboxResult, agent::AgentClient, sandbox::exec::input::InputWindow};
 use microsandbox_types::EnvVar;
+
+use self::output::EventReceiver;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -88,18 +98,31 @@ pub struct ExitStatus {
 }
 
 /// Handle to a streaming exec session.
+///
+/// Output buffering is unlimited by default. When `exec.buffer_bytes` is set,
+/// supported guests wait on a full buffer until output is consumed. Older guests
+/// warn and retain unlimited buffering. Collection is not size-limited.
 pub struct ExecHandle {
     /// Correlation ID for this session (protocol-level u32, exposed as String).
     id: u32,
 
-    /// Event receiver.
-    events: mpsc::UnboundedReceiver<ExecEvent>,
+    /// Event receiver; reading returns negotiated output credit to the guest.
+    events: EventReceiver,
 
     /// Stdin sink (only if `StdinMode::Pipe` was used).
     stdin: Option<ExecSink>,
 
     /// Bridge reference for sending signals/stdin.
     client: Arc<AgentClient>,
+
+    /// Client-owned deadline state, shared with the independent event pump.
+    timeout: Option<Arc<StreamTimeout>>,
+}
+
+struct StreamTimeout {
+    duration: Duration,
+    expired: AtomicBool,
+    failure: Mutex<Option<String>>,
 }
 
 /// Cloneable control handle for a streaming exec session.
@@ -148,6 +171,8 @@ pub enum ExecEvent {
 pub struct ExecSink {
     id: u32,
     client: Arc<AgentClient>,
+    window: Option<Arc<InputWindow>>,
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -308,17 +333,19 @@ impl ExecOutput {
 
 impl ExecHandle {
     /// Create a new exec handle.
-    pub(crate) fn new(
+    fn new(
         id: u32,
-        events: mpsc::UnboundedReceiver<ExecEvent>,
+        events: EventReceiver,
         stdin: Option<ExecSink>,
         client: Arc<AgentClient>,
+        timeout: Option<Arc<StreamTimeout>>,
     ) -> Self {
         Self {
             id,
             events,
             stdin,
             client,
+            timeout,
         }
     }
 
@@ -337,13 +364,7 @@ impl ExecHandle {
 
     /// Consume this handle into separately owned control, stdin, and event parts.
     #[cfg(feature = "ssh")]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        ExecControl,
-        Option<ExecSink>,
-        mpsc::UnboundedReceiver<ExecEvent>,
-    ) {
+    pub(crate) fn into_parts(self) -> (ExecControl, Option<ExecSink>, EventReceiver) {
         (
             ExecControl {
                 id: self.id,
@@ -356,7 +377,9 @@ impl ExecHandle {
 
     /// Receive the next exec event.
     ///
-    /// Returns `None` when the session has ended.
+    /// Returns `None` when the session has ended. A configured timeout is enforced even
+    /// while no events are polled. This raw event API reports the actual exit event;
+    /// [`Self::wait`] and [`Self::collect`] report `ExecTimeout` after a timed-out exit.
     pub async fn recv(&mut self) -> Option<ExecEvent> {
         self.events.recv().await
     }
@@ -369,10 +392,15 @@ impl ExecHandle {
     }
 
     /// Wait for the command to complete and return the exit status.
+    ///
+    /// Returns `ExecTimeout` after the process exits following its configured deadline.
+    /// Cancelling this wait does not cancel the deadline. Failure to deliver termination
+    /// is reported separately, without claiming that the process exited.
     pub async fn wait(&mut self) -> MicrosandboxResult<ExitStatus> {
         while let Some(event) = self.events.recv().await {
             match event {
                 ExecEvent::Exited { code } => {
+                    self.check_timeout()?;
                     return Ok(ExitStatus {
                         code,
                         success: code == 0,
@@ -385,12 +413,12 @@ impl ExecHandle {
             }
         }
 
-        Err(crate::MicrosandboxError::Runtime(
-            "exec session ended without exit event".into(),
-        ))
+        Err(self.incomplete_error())
     }
 
     /// Wait for completion and collect all stdout/stderr.
+    ///
+    /// Uses the same timeout and termination-confirmation behavior as [`Self::wait`].
     pub async fn collect(&mut self) -> MicrosandboxResult<ExecOutput> {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -406,6 +434,7 @@ impl ExecHandle {
                     stderr.extend_from_slice(&data);
                 }
                 ExecEvent::Exited { code } => {
+                    self.check_timeout()?;
                     exit_code = Some(code);
                     break;
                 }
@@ -416,9 +445,7 @@ impl ExecHandle {
             }
         }
 
-        let code = exit_code.ok_or_else(|| {
-            crate::MicrosandboxError::Runtime("exec session ended without exit event".into())
-        })?;
+        let code = exit_code.ok_or_else(|| self.incomplete_error())?;
 
         Ok(ExecOutput {
             status: ExitStatus {
@@ -444,6 +471,25 @@ impl ExecHandle {
     /// Resize the PTY for this session.
     pub async fn resize(&self, rows: u16, cols: u16) -> MicrosandboxResult<()> {
         self.control().resize(rows, cols).await
+    }
+
+    fn check_timeout(&self) -> MicrosandboxResult<()> {
+        if let Some(timeout) = &self.timeout
+            && timeout.expired.load(Ordering::Acquire)
+        {
+            return Err(crate::MicrosandboxError::ExecTimeout(timeout.duration));
+        }
+        Ok(())
+    }
+
+    fn incomplete_error(&self) -> crate::MicrosandboxError {
+        let failure = self
+            .timeout
+            .as_ref()
+            .and_then(|timeout| timeout.failure.lock().unwrap().clone());
+        crate::MicrosandboxError::Runtime(
+            failure.unwrap_or_else(|| "exec session ended without exit event".into()),
+        )
     }
 }
 
@@ -480,23 +526,54 @@ impl ExecControl {
 
 impl ExecSink {
     /// Create a new stdin sink.
-    pub(crate) fn new(id: u32, client: Arc<AgentClient>) -> Self {
-        Self { id, client }
+    fn new(id: u32, client: Arc<AgentClient>, window: Option<Arc<InputWindow>>) -> Self {
+        Self {
+            id,
+            client,
+            window,
+            write_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Write data to the process's stdin.
     pub async fn write(&self, data: impl AsRef<[u8]>) -> MicrosandboxResult<()> {
-        let payload = ExecStdin {
-            data: data.as_ref().to_vec(),
-        };
+        // Serialize chunks so concurrent writes and EOF keep their original operation order.
+        let _write = self.write_lock.lock().await;
+        let data = data.as_ref();
+        if let Some(window) = &self.window {
+            for chunk in data.chunks(16 * 1024) {
+                let reservation = window.reserve(chunk.len() as u32).await?;
+                self.client
+                    .send_with_admission(
+                        self.id,
+                        MessageType::ExecStdin,
+                        &ExecStdin {
+                            data: chunk.to_vec(),
+                        },
+                        || reservation.commit(),
+                    )
+                    .await?;
+            }
+            if !data.is_empty() {
+                return Ok(());
+            }
+        }
+
         self.client
-            .send(self.id, MessageType::ExecStdin, &payload)
+            .send(
+                self.id,
+                MessageType::ExecStdin,
+                &ExecStdin {
+                    data: data.to_vec(),
+                },
+            )
             .await?;
         Ok(())
     }
 
     /// Close stdin (sends EOF to the process).
     pub async fn close(&self) -> MicrosandboxResult<()> {
+        let _write = self.write_lock.lock().await;
         let payload = ExecStdin { data: Vec::new() };
         self.client
             .send(self.id, MessageType::ExecStdin, &payload)
@@ -514,21 +591,30 @@ pub(crate) mod agent {
     //!
     //! Opens a fresh agent UDS each call (option A in the parity plan).
 
-    use std::sync::Arc;
+    use std::{
+        sync::{Arc, Weak},
+        time::Duration,
+    };
 
     use bytes::Bytes;
     use microsandbox_protocol::{
-        exec::{ExecExited, ExecStarted, ExecStderr, ExecStdin, ExecStdout},
+        exec::{ExecExited, ExecStarted, ExecStderr, ExecStdout},
         message::{Message, MessageType},
     };
-    use tokio::sync::mpsc;
+    use tokio::{
+        sync::{mpsc, watch},
+        time::Instant,
+    };
 
     use crate::{
         MicrosandboxError, MicrosandboxResult,
         sandbox::{SandboxConfig, build_exec_request},
     };
 
-    use super::{ExecEvent, ExecHandle, ExecOptions, ExecOutput, ExecSink, ExitStatus, StdinMode};
+    use super::{
+        ExecEvent, ExecHandle, ExecOptions, ExecOutput, ExecSink, ExitStatus, StdinMode,
+        StreamTimeout,
+    };
 
     pub(crate) async fn exec_stream(
         backend: &dyn crate::backend::Backend,
@@ -549,7 +635,13 @@ pub(crate) mod agent {
         rows: u16,
         cols: u16,
     ) -> MicrosandboxResult<ExecHandle> {
+        let output_config = super::output::configuration(backend)?;
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
+        let controlled =
+            output_config.buffer_bytes.is_some() && client.supports(MessageType::ExecOutputCredit);
+        if output_config.buffer_bytes.is_some() && !controlled {
+            tracing::warn!(sandbox = %name, "guest does not support exec output backpressure; retaining legacy unbounded buffering (exec.buffer_bytes is not enforced)");
+        }
         let ExecOptions {
             args,
             cwd,
@@ -558,8 +650,27 @@ pub(crate) mod agent {
             rlimits,
             tty,
             stdin: stdin_mode,
-            timeout: _,
+            timeout,
         } = opts;
+
+        // Validate before dispatch. Count execution time from request dispatch, but never
+        // signal a pre-start correlation: older agents also require ExecStarted first.
+        let deadline = timeout
+            .map(|duration| {
+                Instant::now().checked_add(duration).ok_or_else(|| {
+                    MicrosandboxError::InvalidConfig(
+                        "execution timeout exceeds the supported duration range".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let timeout = timeout.map(|duration| {
+            Arc::new(StreamTimeout {
+                duration,
+                expired: super::AtomicBool::new(false),
+                failure: super::Mutex::new(None),
+            })
+        });
 
         tracing::debug!(
             sandbox = %name,
@@ -570,31 +681,48 @@ pub(crate) mod agent {
             "exec_stream"
         );
 
-        let req = build_exec_request(
+        let mut req = build_exec_request(
             config, cmd, args, cwd, user, &env, &rlimits, tty, rows, cols,
         );
+        req.output_window = output_config.buffer_bytes.filter(|_| controlled);
         let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
+        let input_window = controlled.then(super::input::InputWindow::new);
         let stdin = match &stdin_mode {
-            StdinMode::Pipe => Some(ExecSink::new(id, Arc::clone(&client))),
+            StdinMode::Pipe => Some(ExecSink::new(id, Arc::clone(&client), input_window.clone())),
             _ => None,
         };
 
-        if let StdinMode::Bytes(ref data) = stdin_mode {
-            let data = data.clone();
-            let bridge = Arc::clone(&client);
+        let finite_input = match stdin_mode {
+            // A pipe with no caller-owned writer still needs an explicit guest EOF.
+            // PTYs have no independent stdin half; retain their existing terminal semantics.
+            StdinMode::Null if !tty => Some(Vec::new()),
+            StdinMode::Bytes(data) => Some(data),
+            _ => None,
+        };
+        if let Some(data) = finite_input {
+            let sink = ExecSink::new(id, Arc::clone(&client), input_window.clone());
             tokio::spawn(async move {
-                let payload = ExecStdin { data };
-                let _ = bridge.send(id, MessageType::ExecStdin, &payload).await;
-                let close = ExecStdin { data: Vec::new() };
-                let _ = bridge.send(id, MessageType::ExecStdin, &close).await;
+                if !data.is_empty() {
+                    let _ = sink.write(data).await;
+                }
+                let _ = sink.close().await;
             });
         }
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        tokio::spawn(event_mapper_task(rx, event_tx));
+        let (event_rx, credits) = super::output::receiver(event_rx, controlled);
+        tokio::spawn(event_mapper_task(
+            rx,
+            event_tx,
+            deadline.zip(timeout.clone()),
+            Arc::downgrade(&client),
+            id,
+            credits,
+            input_window,
+        ));
 
-        Ok(ExecHandle::new(id, event_rx, stdin, client))
+        Ok(ExecHandle::new(id, event_rx, stdin, client, timeout))
     }
 
     pub(crate) async fn exec(
@@ -602,9 +730,11 @@ pub(crate) mod agent {
         name: &str,
         config: &SandboxConfig,
         cmd: String,
-        opts: ExecOptions,
+        mut opts: ExecOptions,
     ) -> MicrosandboxResult<ExecOutput> {
-        let timeout_duration = opts.timeout;
+        // Buffered exec keeps its existing deadline and error contract. Do not start a
+        // second timer in its underlying streaming session.
+        let timeout_duration = opts.timeout.take();
         let mut handle = exec_stream(backend, name, config, cmd, opts).await?;
 
         match timeout_duration {
@@ -626,11 +756,88 @@ pub(crate) mod agent {
     async fn event_mapper_task(
         mut rx: mpsc::Receiver<Message>,
         tx: mpsc::UnboundedSender<ExecEvent>,
+        timeout: Option<(Instant, Arc<StreamTimeout>)>,
+        client: Weak<crate::agent::AgentClient>,
+        id: u32,
+        credits: Option<super::output::OutputCredits>,
+        input_window: Option<Arc<super::input::InputWindow>>,
     ) {
-        while let Some(msg) = rx.recv().await {
+        let discarded = credits.as_ref().map(|credits| credits.consumed.clone());
+        let credit = super::output::return_credit(
+            credits.map(|credits| credits.updates),
+            client.clone(),
+            id,
+        );
+        tokio::pin!(credit);
+        let (started_tx, started_rx) = watch::channel(false);
+        let monitor = async {
+            let Some((deadline, state)) = &timeout else {
+                return std::future::pending::<Result<(), String>>().await;
+            };
+            enforce_deadline(*deadline, started_rx, state, async {
+                let client = client
+                    .upgrade()
+                    .ok_or("exec connection closed before timeout termination")?;
+                client
+                    .send(
+                        id,
+                        MessageType::ExecSignal,
+                        &microsandbox_protocol::exec::ExecSignal { signal: 9 },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await
+        };
+        let mut monitor = Some(Box::pin(monitor));
+        let mut reader_closed = false;
+        loop {
+            let msg = tokio::select! {
+                // Preserve completion while a retained stdin/control handle owns the connection.
+                _ = tx.closed(), if !reader_closed => {
+                    reader_closed = true;
+                    continue;
+                },
+                result = &mut credit => {
+                    if let Err(error) = result
+                        && !tx.is_closed()
+                    {
+                        tracing::warn!(%error, "exec output credit delivery failed");
+                    }
+                    break;
+                }
+                result = async { monitor.as_mut().expect("active deadline").await }, if monitor.is_some() => {
+                    monitor = None;
+                    if let Err(error) = result {
+                        let diagnostic = format!("exec timeout termination failed; process exit is unconfirmed: {error}");
+                        if let Some((_, state)) = &timeout {
+                            *state.failure.lock().unwrap() = Some(diagnostic.clone());
+                        }
+                        tracing::warn!(%diagnostic);
+                        break;
+                    }
+                    continue;
+                }
+                msg = rx.recv() => match msg { Some(msg) => msg, None => break },
+            };
             let event = match msg.t {
+                MessageType::ExecStdinCredit => {
+                    if let Some(window) = &input_window {
+                        match msg.payload::<microsandbox_protocol::exec::ExecStdinCredit>() {
+                            Ok(credit) if window.acknowledge(credit.consumed) => {}
+                            _ => {
+                                tracing::warn!("invalid execution stdin credit");
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 MessageType::ExecStarted => match msg.payload::<ExecStarted>() {
-                    Ok(started) => ExecEvent::Started { pid: started.pid },
+                    Ok(started) => {
+                        started_tx.send_replace(true);
+                        ExecEvent::Started { pid: started.pid }
+                    }
                     Err(_) => continue,
                 },
                 MessageType::ExecStdout => match msg.payload::<ExecStdout>() {
@@ -654,6 +861,9 @@ pub(crate) mod agent {
                     break;
                 }
                 MessageType::ExecStdinError => {
+                    if let Some(window) = &input_window {
+                        window.close();
+                    }
                     match msg.payload::<microsandbox_protocol::exec::ExecStdinError>() {
                         Ok(payload) => ExecEvent::StdinError(payload),
                         Err(_) => continue,
@@ -661,10 +871,34 @@ pub(crate) mod agent {
                 }
                 _ => continue,
             };
-            if tx.send(event).is_err() {
-                break;
+            if let Err(error) = tx.send(event)
+                && let Some(consumed) = &discarded
+            {
+                super::output::consume(consumed, &error.0);
             }
         }
+        if let Some(window) = input_window {
+            window.close();
+        }
+    }
+
+    async fn enforce_deadline(
+        deadline: Instant,
+        mut started: watch::Receiver<bool>,
+        state: &StreamTimeout,
+        signal: impl std::future::Future<Output = Result<(), String>>,
+    ) -> Result<(), String> {
+        tokio::time::sleep_until(deadline).await;
+        started
+            .wait_for(|started| *started)
+            .await
+            .map_err(|_| "exec ended before startup acknowledgement")?;
+        state.expired.store(true, super::Ordering::Release);
+        // Older transports may block a signal behind input. Bound delivery instead of
+        // hanging the caller or falsely claiming that the guest has exited.
+        tokio::time::timeout(Duration::from_secs(5), signal)
+            .await
+            .map_err(|_| "signal delivery did not complete within five seconds".to_owned())?
     }
 
     // Re-export so backend trait impl can also use ExitStatus for typing.
@@ -673,6 +907,385 @@ pub(crate) mod agent {
         ExitStatus {
             code,
             success: code == 0,
+        }
+    }
+
+    //--------------------------------------------------------------------------------------------------
+    // Tests
+    //--------------------------------------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::*;
+
+        async fn flow_test_client() -> (Arc<crate::agent::AgentClient>, tokio::io::DuplexStream) {
+            use tokio::io::AsyncWriteExt;
+
+            let (host, mut peer) = tokio::io::duplex(1024);
+            let connect = crate::agent::AgentClient::connect_stream_with_timeout(
+                host,
+                Duration::from_secs(3),
+            );
+            let handshake = async {
+                peer.write_all(&1u32.to_be_bytes()).await.unwrap();
+                peer.write_all(&1024u32.to_be_bytes()).await.unwrap();
+                let ready = Message::with_payload(
+                    MessageType::Ready,
+                    0,
+                    &microsandbox_protocol::core::Ready::default(),
+                )
+                .unwrap();
+                microsandbox_protocol::codec::write_message(&mut peer, &ready)
+                    .await
+                    .unwrap();
+                peer
+            };
+            let (client, peer) = tokio::join!(connect, handshake);
+            (Arc::new(client.unwrap()), peer)
+        }
+
+        #[tokio::test]
+        async fn cancelled_stdin_respects_transport_admission() {
+            use microsandbox_protocol::exec::{EXEC_STDIN_WINDOW, ExecStdin};
+            use std::future::{Future, poll_fn};
+            use std::task::Poll;
+
+            let (client, mut peer) = flow_test_client().await;
+            let window = super::super::input::InputWindow::new();
+            let sink = ExecSink::new(77, client.clone(), Some(window.clone()));
+            let filler = ExecStdin {
+                data: vec![1; 4096],
+            };
+            let mut pending: Vec<_> = (100..132)
+                .map(|id| Box::pin(client.send(id, MessageType::ExecStdin, &filler)))
+                .collect();
+            // Fill the real bounded writer queue while the peer does not read.
+            poll_fn(|cx| {
+                for send in &mut pending {
+                    assert!(send.as_mut().poll(cx).is_pending());
+                }
+                Poll::Ready(())
+            })
+            .await;
+
+            for _ in 0..4 {
+                let mut write = Box::pin(sink.write(vec![2; 16 * 1024]));
+                poll_fn(|cx| {
+                    assert!(write.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                drop(write);
+            }
+            drop(pending);
+
+            let receive = async {
+                let mut bytes = 0;
+                while bytes < EXEC_STDIN_WINDOW as usize {
+                    let msg = microsandbox_protocol::codec::read_message(&mut peer)
+                        .await
+                        .unwrap();
+                    if msg.id == 77 {
+                        let data = msg.payload::<ExecStdin>().unwrap().data;
+                        assert!(data.iter().all(|byte| *byte == 3));
+                        bytes += data.len();
+                    }
+                }
+                assert_eq!(bytes, EXEC_STDIN_WINDOW as usize);
+            };
+            tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(
+                    async {
+                        sink.write(vec![3; EXEC_STDIN_WINDOW as usize])
+                            .await
+                            .unwrap();
+                    },
+                    receive
+                );
+            })
+            .await
+            .expect("cancelled writes must not consume capacity");
+
+            assert!(window.acknowledge(u64::from(EXEC_STDIN_WINDOW)));
+            let mut write = Box::pin(sink.write(vec![4; 16 * 1024]));
+            poll_fn(|cx| {
+                assert!(write.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            // The frame is admitted, but the peer has not read it yet. Cancelling
+            // must keep its charge and allow the eventual acknowledgement.
+            drop(write);
+            let msg = tokio::time::timeout(
+                Duration::from_secs(3),
+                microsandbox_protocol::codec::read_message(&mut peer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(msg.id, 77);
+            assert_eq!(msg.payload::<ExecStdin>().unwrap().data, vec![4; 16 * 1024]);
+            assert!(window.acknowledge(u64::from(EXEC_STDIN_WINDOW) + 16 * 1024));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn dropped_reader_preserves_timeout_and_output_flow() {
+            use microsandbox_protocol::exec::{
+                EXEC_OUTPUT_EVENT_OVERHEAD, ExecOutputCredit, ExecRequest,
+            };
+
+            for controlled in [false, true] {
+                let (client, mut peer) = flow_test_client().await;
+                let request: ExecRequest = serde_json::from_value(
+                    serde_json::json!({"cmd":"cat", "output_window":controlled.then_some(65536)}),
+                )
+                .unwrap();
+                let ((id, rx), _) = tokio::join!(
+                    async {
+                        client
+                            .stream(MessageType::ExecRequest, &request)
+                            .await
+                            .unwrap()
+                    },
+                    async {
+                        microsandbox_protocol::codec::read_message(&mut peer)
+                            .await
+                            .unwrap();
+                    }
+                );
+                let (tx, events) = mpsc::unbounded_channel();
+                let (events, credits) = super::super::output::receiver(events, controlled);
+                let pump = tokio::spawn(event_mapper_task(
+                    rx,
+                    tx,
+                    Some((Instant::now() + Duration::from_secs(10), Arc::new(state()))),
+                    Arc::downgrade(&client),
+                    id,
+                    credits,
+                    None,
+                ));
+                let handle = ExecHandle::new(id, events, None, client, None);
+                let control = handle.control();
+
+                let started =
+                    Message::with_payload(MessageType::ExecStarted, id, &ExecStarted { pid: 123 })
+                        .unwrap();
+                microsandbox_protocol::codec::write_message(&mut peer, &started)
+                    .await
+                    .unwrap();
+
+                let output = Message::with_payload(
+                    MessageType::ExecStdout,
+                    id,
+                    &ExecStdout {
+                        data: vec![1; 4096],
+                    },
+                )
+                .unwrap();
+                microsandbox_protocol::codec::write_message(&mut peer, &output)
+                    .await
+                    .unwrap();
+                drop(handle);
+
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    if controlled {
+                        for chunks in 1..=2 {
+                            let expected = chunks * (4096 + u64::from(EXEC_OUTPUT_EVENT_OVERHEAD));
+                            let msg = microsandbox_protocol::codec::read_message(&mut peer)
+                                .await
+                                .unwrap();
+                            assert_eq!(msg.t, MessageType::ExecOutputCredit);
+                            assert_eq!(
+                                msg.payload::<ExecOutputCredit>().unwrap().consumed,
+                                expected
+                            );
+                            if chunks == 1 {
+                                microsandbox_protocol::codec::write_message(&mut peer, &output)
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    tokio::time::advance(Duration::from_secs(10)).await;
+                    let signal = microsandbox_protocol::codec::read_message(&mut peer)
+                        .await
+                        .unwrap();
+                    assert_eq!(signal.t, MessageType::ExecSignal);
+                    assert_eq!(
+                        signal
+                            .payload::<microsandbox_protocol::exec::ExecSignal>()
+                            .unwrap()
+                            .signal,
+                        9
+                    );
+                    let exited =
+                        Message::with_payload(MessageType::ExecExited, id, &ExecExited { code: 0 })
+                            .unwrap();
+                    microsandbox_protocol::codec::write_message(&mut peer, &exited)
+                        .await
+                        .unwrap();
+                    pump.await.unwrap();
+                })
+                .await
+                .expect("retained control handle must not strand the producer");
+                drop(control);
+            }
+        }
+
+        fn state() -> StreamTimeout {
+            StreamTimeout {
+                duration: Duration::from_secs(1),
+                expired: AtomicBool::new(false),
+                failure: Mutex::new(None),
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_deadline_waits_for_start_and_fires_once() {
+            let state = state();
+            let (started, receiver) = watch::channel(false);
+            let signalled = AtomicBool::new(false);
+            let deadline = enforce_deadline(Instant::now(), receiver, &state, async {
+                assert!(!signalled.swap(true, Ordering::SeqCst));
+                Ok(())
+            });
+            tokio::pin!(deadline);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(10), &mut deadline)
+                    .await
+                    .is_err()
+            );
+            assert!(!state.expired.load(Ordering::Acquire));
+            assert!(!signalled.load(Ordering::SeqCst));
+            started.send_replace(true);
+            deadline.await.unwrap();
+            assert!(state.expired.load(Ordering::Acquire));
+            assert!(signalled.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_deadline_cancelled_before_expiry_does_not_signal() {
+            let state = state();
+            let (_started, receiver) = watch::channel(true);
+            let signalled = AtomicBool::new(false);
+            {
+                let deadline = enforce_deadline(
+                    Instant::now() + Duration::from_secs(2),
+                    receiver,
+                    &state,
+                    async {
+                        signalled.store(true, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+                tokio::pin!(deadline);
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), &mut deadline)
+                        .await
+                        .is_err()
+                );
+            }
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert!(!state.expired.load(Ordering::Acquire));
+            assert!(!signalled.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_deadline_bounds_and_reports_signal_failure() {
+            let state = state();
+            let (_started, receiver) = watch::channel(true);
+            assert_eq!(
+                enforce_deadline(Instant::now(), receiver.clone(), &state, async {
+                    Err("delivery_unconfirmed".into())
+                })
+                .await
+                .unwrap_err(),
+                "delivery_unconfirmed"
+            );
+            let before = Instant::now();
+            let error = enforce_deadline(before, receiver, &state, std::future::pending())
+                .await
+                .unwrap_err();
+            assert!(error.contains("five seconds"));
+            assert_eq!(Instant::now() - before, Duration::from_secs(5));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_pump_exit_cancels_deadline_without_late_signal() {
+            let state = Arc::new(state());
+            let (tx, rx) = mpsc::channel(2);
+            let (events_tx, mut events) = mpsc::unbounded_channel();
+            tx.send(
+                Message::with_payload(MessageType::ExecStarted, 1, &ExecStarted { pid: 123 })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            tx.send(
+                Message::with_payload(MessageType::ExecExited, 1, &ExecExited { code: 0 }).unwrap(),
+            )
+            .await
+            .unwrap();
+            event_mapper_task(
+                rx,
+                events_tx,
+                Some((Instant::now() + Duration::from_secs(1), state.clone())),
+                Weak::new(),
+                1,
+                None,
+                None,
+            )
+            .await;
+            assert!(matches!(
+                events.recv().await,
+                Some(ExecEvent::Started { pid: 123 })
+            ));
+            assert!(matches!(
+                events.recv().await,
+                Some(ExecEvent::Exited { code: 0 })
+            ));
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert!(!state.expired.load(Ordering::Acquire));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stream_pump_reports_unconfirmed_termination_without_fake_exit() {
+            let state = Arc::new(state());
+            let (tx, rx) = mpsc::channel(1);
+            let (events_tx, mut events) = mpsc::unbounded_channel();
+            tx.send(
+                Message::with_payload(MessageType::ExecStarted, 1, &ExecStarted { pid: 123 })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            event_mapper_task(
+                rx,
+                events_tx,
+                Some((Instant::now(), state.clone())),
+                Weak::new(),
+                1,
+                None,
+                None,
+            )
+            .await;
+            assert!(matches!(
+                events.recv().await,
+                Some(ExecEvent::Started { .. })
+            ));
+            assert!(events.recv().await.is_none());
+            assert!(
+                state
+                    .failure
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .contains("process exit is unconfirmed")
+            );
         }
     }
 }

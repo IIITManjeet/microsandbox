@@ -22,6 +22,7 @@ use microsandbox_protocol::transport::ClientIncarnation;
 
 use crate::config::SecurityProfile;
 use crate::error::{AgentdError, AgentdResult};
+use crate::exec_output::OutputWindow;
 use crate::process::{ProcessExitWatcher, ProcessIdentity, ProcessManager};
 use crate::rlimit;
 use crate::serial::InputCharge;
@@ -156,6 +157,10 @@ pub struct ExecSession {
 
     /// Accepted input stays ordered, including EOF, while a pipe or PTY backpressures.
     pending_stdin: VecDeque<PendingStdin>,
+
+    output_window: Option<Arc<OutputWindow>>,
+    stdin_consumed: u64,
+    stdin_credit_sent: u64,
 }
 
 #[derive(Debug)]
@@ -691,6 +696,23 @@ impl ExecSession {
         }
     }
 
+    /// Return output capacity without waiting for the output reader.
+    pub(crate) fn acknowledge_output(&self, consumed: u64) -> AgentdResult<()> {
+        if let Some(window) = &self.output_window {
+            window.acknowledge(consumed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_stdin_credit(&mut self) -> Option<u64> {
+        if self.output_window.is_some() && self.stdin_consumed != self.stdin_credit_sent {
+            self.stdin_credit_sent = self.stdin_consumed;
+            Some(self.stdin_consumed)
+        } else {
+            None
+        }
+    }
+
     /// Returns the PID of the spawned process (as u32 for the protocol).
     pub fn pid(&self) -> u32 {
         self.process_identity.pid() as u32
@@ -750,9 +772,15 @@ impl ExecSession {
                 return Ok(());
             }
             match self.try_write_stdin(&data) {
-                Ok(count) if count == data.len() => return Ok(()),
+                Ok(count) if count == data.len() => {
+                    self.stdin_consumed += count as u64;
+                    return Ok(());
+                }
                 Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-                Ok(count) => written = count,
+                Ok(count) => {
+                    self.stdin_consumed += count as u64;
+                    written = count;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
@@ -772,6 +800,9 @@ impl ExecSession {
     /// The restored process no longer has a host-side stdin owner. Drain everything accepted
     /// before the cut, then close pipe input. A PTY has no separate write half to close safely.
     pub(crate) fn detach_stdin(&mut self) {
+        if let Some(window) = self.output_window.take() {
+            window.detach();
+        }
         if self.stdin.is_none() {
             return;
         }
@@ -817,6 +848,7 @@ impl ExecSession {
                         .front_mut()
                         .expect("polled pending input");
                     pending.written += count;
+                    self.stdin_consumed += count as u64;
                     if pending.written == pending.data.len() {
                         self.pending_stdin.pop_front();
                     }
@@ -887,6 +919,7 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
+        let output_window = OutputWindow::new(req.output_window)?;
         let pty = pty::openpty(None, None)?;
         let err_pipe = new_exec_error_pipe()?;
 
@@ -1026,6 +1059,20 @@ impl ExecSession {
                 unsafe { libc::_exit(1) };
             }
 
+            // Group lookup can open /etc/group; finish it before restrictive limits.
+            if let Some(ref user) = resolved_user
+                && apply_resolved_groups(user).is_err()
+            {
+                unsafe { libc::_exit(1) };
+            }
+
+            // Apply limits while privileged so non-root commands can raise hard limits.
+            for (resource, limit) in &parsed_rlimits {
+                if unsafe { libc::setrlimit(*resource as _, limit) } != 0 {
+                    unsafe { libc::_exit(1) };
+                }
+            }
+
             if let Some(ref user) = resolved_user
                 && apply_resolved_user(user).is_err()
             {
@@ -1035,13 +1082,6 @@ impl ExecSession {
             if let (Some(key), Some(home)) = (&home_key, &default_home) {
                 unsafe {
                     libc::setenv(key.as_ptr(), home.as_ptr(), 1);
-                }
-            }
-
-            // Apply resource limits.
-            for (resource, limit) in &parsed_rlimits {
-                if unsafe { libc::setrlimit(*resource as _, limit) } != 0 {
-                    unsafe { libc::_exit(1) };
                 }
             }
 
@@ -1092,7 +1132,13 @@ impl ExecSession {
         })?;
 
         // Spawn background reader task.
-        tokio::spawn(pty_reader_task(id, reader_fd, exit_watcher, tx));
+        tokio::spawn(pty_reader_task(
+            id,
+            reader_fd,
+            exit_watcher,
+            tx,
+            output_window.clone(),
+        ));
 
         Ok(Self {
             process_identity,
@@ -1100,6 +1146,9 @@ impl ExecSession {
             pty_master: Some(pty_master),
             stdin: None,
             pending_stdin: VecDeque::new(),
+            output_window,
+            stdin_consumed: 0,
+            stdin_credit_sent: 0,
         })
     }
 
@@ -1113,6 +1162,7 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
+        let output_window = OutputWindow::new(req.output_window)?;
         let mut cmd = Command::new(&req.cmd);
         cmd.args(&req.args)
             .stdin(Stdio::piped())
@@ -1151,13 +1201,21 @@ impl ExecSession {
                     return Err(std::io::Error::last_os_error());
                 }
                 apply_exec_security_profile(security_profile).map_err(agentd_to_io_error)?;
+
+                // Group lookup must finish before limits can prevent opening /etc/group.
                 if let Some(ref user) = resolved_user {
-                    apply_resolved_user(user).map_err(agentd_to_io_error)?;
+                    apply_resolved_groups(user).map_err(agentd_to_io_error)?;
                 }
+
+                // Apply limits before dropping the privilege needed to raise hard limits.
                 for (resource, limit) in &parsed_rlimits {
                     if libc::setrlimit(*resource as _, limit) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
+                }
+
+                if let Some(ref user) = resolved_user {
+                    apply_resolved_user(user).map_err(agentd_to_io_error)?;
                 }
                 Ok(())
             });
@@ -1180,7 +1238,14 @@ impl ExecSession {
             })?;
 
         // Spawn background reader task.
-        tokio::spawn(pipe_reader_task(id, stdout, stderr, exit_watcher, tx));
+        tokio::spawn(pipe_reader_task(
+            id,
+            stdout,
+            stderr,
+            exit_watcher,
+            tx,
+            output_window.clone(),
+        ));
 
         Ok(Self {
             process_identity,
@@ -1188,6 +1253,9 @@ impl ExecSession {
             pty_master: None,
             stdin,
             pending_stdin: VecDeque::new(),
+            output_window,
+            stdin_consumed: 0,
+            stdin_credit_sent: 0,
         })
     }
 }
@@ -1198,6 +1266,9 @@ impl ExecSession {
 
 impl Drop for ExecSession {
     fn drop(&mut self) {
+        if let Some(window) = &self.output_window {
+            window.close();
+        }
         // The registration deliberately outlives the direct child so signals
         // can still reach descendants while their output is being drained.
         self.process_manager.release(self.process_identity);
@@ -1386,6 +1457,27 @@ pub(crate) fn resolve_default_user(default_user: Option<&str>) -> AgentdResult<(
     Ok((resolved.uid, resolved.gid))
 }
 
+/// Like [`resolve_default_user`], plus the supplementary groups exec would apply to that user.
+pub(crate) fn resolve_user_groups(user: &str) -> AgentdResult<(u32, u32, Vec<libc::gid_t>)> {
+    let resolved = resolve_user_spec(user)?;
+    let mut groups = Vec::new();
+    if let Some(ref name) = resolved.initgroups_user {
+        let mut count: libc::c_int = 32;
+        loop {
+            groups.resize(count as usize, 0);
+            if unsafe {
+                libc::getgrouplist(name.as_ptr(), resolved.gid, groups.as_mut_ptr(), &mut count)
+            } >= 0
+            {
+                groups.truncate(count as usize);
+                break;
+            }
+            count = count.max(groups.len() as libc::c_int + 1);
+        }
+    }
+    Ok((resolved.uid, resolved.gid, groups))
+}
+
 fn resolve_requested_user(
     req: &ExecRequest,
     default_user: Option<&str>,
@@ -1417,7 +1509,7 @@ fn resolve_user_spec(spec: &str) -> AgentdResult<ResolvedUser> {
         lookup_passwd_by_uid(uid)?
     } else {
         lookup_passwd_by_name(user_part)?
-            .ok_or_else(|| AgentdError::ExecSession(format!("guest user not found: {user_part}")))?
+            .ok_or_else(|| AgentdError::UserNotFound(user_part.to_owned()))?
             .into()
     };
 
@@ -1474,7 +1566,7 @@ fn resolve_group_spec(spec: &str) -> AgentdResult<libc::gid_t> {
 
     lookup_group_by_name(spec)?
         .map(|entry| entry.gid)
-        .ok_or_else(|| AgentdError::ExecSession(format!("guest group not found: {spec}")))
+        .ok_or_else(|| AgentdError::GroupNotFound(spec.to_owned()))
 }
 
 fn parse_id(value: &str) -> Result<u32, std::num::ParseIntError> {
@@ -1593,7 +1685,7 @@ fn lookup_buffer_len() -> usize {
     if size > 0 { size as usize } else { 16 * 1024 }
 }
 
-fn apply_resolved_user(user: &ResolvedUser) -> AgentdResult<()> {
+fn apply_resolved_groups(user: &ResolvedUser) -> AgentdResult<()> {
     if let Some(ref name) = user.initgroups_user {
         if unsafe { libc::initgroups(name.as_ptr(), user.gid) } != 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -1602,6 +1694,10 @@ fn apply_resolved_user(user: &ResolvedUser) -> AgentdResult<()> {
         return Err(std::io::Error::last_os_error().into());
     }
 
+    Ok(())
+}
+
+fn apply_resolved_user(user: &ResolvedUser) -> AgentdResult<()> {
     if unsafe { libc::setgid(user.gid) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -1695,6 +1791,7 @@ async fn pty_reader_task(
     master_fd: OwnedFd,
     exit_watcher: ProcessExitWatcher,
     tx: SessionOutputSender,
+    output_window: Option<Arc<OutputWindow>>,
 ) {
     let tx_output = tx.clone();
     let runtime_handle = tokio::runtime::Handle::current();
@@ -1713,6 +1810,11 @@ async fn pty_reader_task(
             if n > 0 {
                 let n = n as usize;
                 let sent = runtime_handle.block_on(async {
+                    if let Some(window) = &output_window
+                        && !window.acquire(n).await
+                    {
+                        return false;
+                    }
                     let Some(permit) = tx_output.reserve(n).await else {
                         return false;
                     };
@@ -1758,6 +1860,7 @@ async fn pipe_reader_task(
     stderr: Option<tokio::process::ChildStderr>,
     exit_watcher: ProcessExitWatcher,
     tx: SessionOutputSender,
+    output_window: Option<Arc<OutputWindow>>,
 ) {
     let mut stdout = stdout;
     let mut stderr = stderr;
@@ -1781,6 +1884,10 @@ async fn pipe_reader_task(
                         stdout_eof = true;
                     }
                     Ok(n) => {
+                        if let Some(window) = &output_window
+                            && !window.acquire(n).await {
+                            break;
+                        }
                         let Some(permit) = tx.reserve(n).await else {
                             break;
                         };
@@ -1809,6 +1916,10 @@ async fn pipe_reader_task(
                         stderr_eof = true;
                     }
                     Ok(n) => {
+                        if let Some(window) = &output_window
+                            && !window.acquire(n).await {
+                            break;
+                        }
                         let Some(permit) = tx.reserve(n).await else {
                             break;
                         };
@@ -2035,6 +2146,7 @@ mod tests {
 
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "sleep 30 & echo $!".to_string()],
             env: Vec::new(),
@@ -2179,6 +2291,7 @@ mod tests {
                 let _runtime = handle.enter();
                 let code = 20 + offset as i32;
                 let req = ExecRequest {
+                    output_window: None,
                     cmd: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), format!("exit {code}")],
                     env: Vec::new(),
@@ -2268,6 +2381,7 @@ mod tests {
     async fn run_single_pipe_spawn(id: u32, code: i32) {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), format!("exit {code}")],
             env: Vec::new(),
@@ -2361,10 +2475,148 @@ mod tests {
         assert_eq!(code, 63);
     }
 
+    // Run on Linux as root with CAP_SYS_RESOURCE and a finite memlock hard limit.
+    // The test executable must be static so nofile=0 cannot block its loader.
+    // For Docker: --cap-add SYS_RESOURCE --ulimit memlock=8388608:8388608.
+    #[test]
+    #[ignore = "requires root, CAP_SYS_RESOURCE, finite memlock, and a static test binary"]
+    fn test_piped_nonroot_rlimits() {
+        check_nonroot_rlimits(false);
+    }
+
+    #[test]
+    #[ignore = "requires root, CAP_SYS_RESOURCE, finite memlock, and a static test binary"]
+    fn test_pty_nonroot_rlimits() {
+        check_nonroot_rlimits(true);
+    }
+
+    fn check_nonroot_rlimits(tty: bool) {
+        const PROBE_ENV: &str = "MSB_AGENTD_RLIMIT_PROBE";
+        if let Ok(expected) = std::env::var(PROBE_ENV) {
+            // This branch runs after the real session fork/exec and user switch.
+            assert_eq!(unsafe { libc::geteuid() }, 65534);
+            assert_eq!(unsafe { libc::getegid() }, 65534);
+            let expected: u64 = expected.parse().unwrap();
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) },
+                0
+            );
+            assert_eq!((limit.rlim_cur, limit.rlim_max), (expected, expected));
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+                0
+            );
+            assert_eq!((limit.rlim_cur, limit.rlim_max), (0, 0));
+            return;
+        }
+
+        assert_eq!(unsafe { libc::geteuid() }, 0, "requires guest root");
+        let mut baseline = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut baseline) },
+            0
+        );
+        assert_ne!(
+            baseline.rlim_max,
+            libc::RLIM_INFINITY,
+            "requires a finite baseline"
+        );
+        let raised = baseline.rlim_max.checked_add(1024 * 1024).unwrap();
+        let user = lookup_passwd_by_uid(65534).expect("look up nobody");
+        assert!(
+            matches!(user, ResolvedUserLookup::Known(_)),
+            "requires UID 65534 in /etc/passwd to exercise initgroups"
+        );
+        let test_name = if tty {
+            "session::tests::test_pty_nonroot_rlimits"
+        } else {
+            "session::tests::test_piped_nonroot_rlimits"
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for profile in [SecurityProfile::Default, SecurityProfile::Restricted] {
+                let (tx, mut rx) = SessionOutputSender::channel();
+                let req = ExecRequest {
+                    output_window: None,
+                    cmd: std::env::current_exe().unwrap().to_str().unwrap().into(),
+                    args: vec![
+                        "--exact".into(),
+                        test_name.into(),
+                        "--ignored".into(),
+                        "--nocapture".into(),
+                    ],
+                    env: vec![format!("{PROBE_ENV}={raised}")],
+                    cwd: None,
+                    user: Some("65534:65534".into()),
+                    tty,
+                    rows: 24,
+                    cols: 80,
+                    rlimits: vec![
+                        microsandbox_protocol::exec::ExecRlimit {
+                            resource: "memlock".into(),
+                            soft: raised,
+                            hard: raised,
+                        },
+                        microsandbox_protocol::exec::ExecRlimit {
+                            resource: "nofile".into(),
+                            soft: 0,
+                            hard: 0,
+                        },
+                    ],
+                };
+                let session = ExecSession::spawn(7, &req, tx, None, profile, None)
+                    .expect("spawn non-root command with raised memlock and nofile=0");
+                let result = time::timeout(Duration::from_secs(10), async {
+                    let mut output = Vec::new();
+                    while let Some(envelope) = rx.recv().await {
+                        match envelope.output {
+                            SessionOutput::Exited(code) => return (code, output),
+                            SessionOutput::Stdout(data) | SessionOutput::Stderr(data) => {
+                                output.extend(data)
+                            }
+                            _ => {}
+                        }
+                    }
+                    panic!("session closed without an exit status");
+                })
+                .await;
+                if result.is_err() {
+                    let _ = session.send_signal(libc::SIGKILL);
+                }
+                let (code, output) = result.expect("non-root command timed out");
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&output));
+            }
+        });
+
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut after) },
+            0
+        );
+        assert_eq!(
+            (after.rlim_cur, after.rlim_max),
+            (baseline.rlim_cur, baseline.rlim_max)
+        );
+    }
+
     #[tokio::test]
     async fn test_pty_reader_drains_ready_fd() {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
@@ -2433,6 +2685,7 @@ mod tests {
     #[test]
     fn test_request_user_overrides_config_default() {
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2451,6 +2704,7 @@ mod tests {
     #[test]
     fn test_config_default_user_used_when_request_has_none() {
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2474,6 +2728,7 @@ mod tests {
     #[test]
     fn test_request_without_user_does_not_apply_user_switch() {
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2498,6 +2753,7 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_resolved_user_home() {
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2527,6 +2783,7 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_root_when_user_absent() {
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2551,6 +2808,7 @@ mod tests {
     #[test]
     fn test_default_home_dir_respects_explicit_home_env() {
         let req = ExecRequest {
+            output_window: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: vec!["HOME=/tmp/custom".to_string()],
@@ -2579,6 +2837,7 @@ mod tests {
     async fn test_spawn_pipe_error_does_not_include_probe_details() {
         let (tx, _rx) = SessionOutputSender::channel();
         let req = ExecRequest {
+            output_window: None,
             cmd: "/definitely/not/a/real/binary".to_string(),
             args: Vec::new(),
             env: Vec::new(),

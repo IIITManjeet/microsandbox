@@ -34,7 +34,7 @@ pub struct ModifyArgs {
     pub name: String,
 
     /// Compact sealed layers of the root and sandbox-owned data disks without changing snapshots.
-    #[arg(long, conflicts_with_all = ["cpus", "max_cpus", "memory", "max_memory", "root_disk", "oci_upper_size", "env", "env_remove", "labels", "label_remove", "workdir", "secrets", "secret_remove", "next_start", "restart"])]
+    #[arg(long, conflicts_with_all = ["cpus", "max_cpus", "memory", "max_memory", "root_disk", "oci_upper_size", "env", "env_remove", "labels", "label_remove", "workdir", "secrets", "secret_remove", "ports", "ports_remove", "next_start", "restart"])]
     pub compact: bool,
 
     /// Merge up to N oldest sealed physical layers per disk, including the base (minimum 2).
@@ -112,6 +112,14 @@ pub struct ModifyArgs {
     /// Remove a secret by name.
     #[arg(long = "secret-rm", value_name = "NAME")]
     pub secret_remove: Vec<String>,
+
+    /// Add or update published ports: `[BIND_ADDR:]HOST[-END]:GUEST[-END][/tcp|udp]`.
+    #[arg(short = 'p', long = "port", value_name = "MAPPING")]
+    pub ports: Vec<String>,
+
+    /// Remove a published host endpoint: `[BIND_ADDR:]HOST[/tcp|udp]`.
+    #[arg(long = "port-rm", value_name = "ENDPOINT")]
+    pub ports_remove: Vec<String>,
 
     /// Show the plan without applying anything.
     #[arg(long)]
@@ -198,6 +206,7 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
     builder = apply_resource_args(builder, &args)?;
     builder = apply_spec_args(builder, &args)?;
     builder = apply_secret_args(builder, &args)?;
+    builder = apply_port_args(builder, &args)?;
 
     let plan = builder.clone().dry_run().await?;
     if args.dry_run {
@@ -405,6 +414,56 @@ fn apply_spec_args(
     Ok(builder)
 }
 
+#[allow(unused_mut)]
+fn apply_port_args(
+    mut builder: SandboxModificationBuilder,
+    args: &ModifyArgs,
+) -> anyhow::Result<SandboxModificationBuilder> {
+    #[cfg(feature = "net")]
+    for value in &args.ports {
+        for port in common::parse_port_mapping(value)? {
+            builder = builder.port_mapping(microsandbox_types::PublishedPortSpec {
+                host_bind: port.host_bind.to_string(),
+                host_port: port.host_port,
+                guest_port: port.guest_port,
+                protocol: match port.protocol {
+                    microsandbox_network::config::PortProtocol::Udp => {
+                        microsandbox_types::PortProtocol::Udp
+                    }
+                    microsandbox_network::config::PortProtocol::Tcp => {
+                        microsandbox_types::PortProtocol::Tcp
+                    }
+                },
+            });
+        }
+    }
+    #[cfg(feature = "net")]
+    for value in &args.ports_remove {
+        let (endpoint, protocol) = value.split_once('/').unwrap_or((value, "tcp"));
+        let mapping = format!("{endpoint}:1/{protocol}");
+        for port in common::parse_port_mapping(&mapping)? {
+            builder = builder.remove_port(microsandbox::sandbox::PublishedPortKey {
+                host_bind: port.host_bind.to_string(),
+                host_port: port.host_port,
+                protocol: match port.protocol {
+                    microsandbox_network::config::PortProtocol::Udp => {
+                        microsandbox_types::PortProtocol::Udp
+                    }
+                    microsandbox_network::config::PortProtocol::Tcp => {
+                        microsandbox_types::PortProtocol::Tcp
+                    }
+                },
+            });
+        }
+    }
+
+    #[cfg(not(feature = "net"))]
+    if !args.ports.is_empty() || !args.ports_remove.is_empty() {
+        anyhow::bail!("published port changes require a build with networking support");
+    }
+    Ok(builder)
+}
+
 fn apply_secret_args(
     mut builder: SandboxModificationBuilder,
     args: &ModifyArgs,
@@ -430,6 +489,23 @@ fn apply_secret_args(
                     }
                 }
                 existing.substitute_headers &= parsed.substitute_headers;
+                if existing.substitute_headers {
+                    match common::intersect_header_fields(
+                        &existing.substitute_header_fields,
+                        &parsed.substitute_header_fields,
+                    ) {
+                        Some(merged) => existing.substitute_header_fields = merged,
+                        None => {
+                            // The scopes share no field: the empty allowlist is
+                            // equivalent to disabling header substitution and
+                            // must not fall back to substituting in every header.
+                            existing.substitute_headers = false;
+                            existing.substitute_header_fields.clear();
+                        }
+                    }
+                } else {
+                    existing.substitute_header_fields.clear();
+                }
                 existing.substitute_query |= parsed.substitute_query;
                 existing.substitute_body |= parsed.substitute_body;
             }
@@ -444,6 +520,11 @@ fn apply_secret_args(
                 .source(SecretSource::Env { var: name.clone() })
                 .substitution(microsandbox_types::SecretSubstitution {
                     headers: spec.substitute_headers,
+                    header_fields: if spec.substitute_headers {
+                        spec.substitute_header_fields.clone()
+                    } else {
+                        Vec::new()
+                    },
                     query: spec.substitute_query,
                     body: spec.substitute_body,
                 });
@@ -451,7 +532,7 @@ fn apply_secret_args(
                 s = s.allow(host);
             }
             for host in spec.passthrough_hosts {
-                s = s.allow_passthrough_for(host);
+                s = s.allow_placeholder_for(host);
             }
             s
         });
@@ -507,20 +588,17 @@ fn print_human_plan(plan: &SandboxModificationPlan) {
 
     table.print();
     for warning in &plan.warnings {
-        eprintln!("{}", style(warning_line(warning)).dim());
+        ui::warn(&warning_line(warning));
     }
     if include_effect {
-        eprintln!("{}", style("   dry run · nothing applied").dim());
+        ui::notice("Dry run", "nothing applied");
     } else {
-        eprintln!(
-            "{}",
-            style("   dry run · applies on next start · nothing applied").dim()
-        );
+        ui::notice("Dry run", "applies on next start · nothing applied");
     }
 }
 
 fn warning_line(warning: &ModificationWarning) -> String {
-    format!("   ! {}: {}", warning.field, warning.message)
+    format!("{}: {}", warning.field, warning.message)
 }
 
 fn apply_blocker(args: &ModifyArgs, plan: &SandboxModificationPlan) -> Option<ApplyBlocker> {
@@ -857,6 +935,13 @@ fn replayed_args(args: &ModifyArgs) -> String {
     }
     for secret in &args.secret_remove {
         rendered.push(format!("--secret-rm {secret}"));
+    }
+
+    for port in &args.ports {
+        rendered.push(format!("--port {port}"));
+    }
+    for port in &args.ports_remove {
+        rendered.push(format!("--port-rm {port}"));
     }
 
     if rendered.is_empty() {
@@ -1232,7 +1317,7 @@ mod tests {
 
         assert_eq!(
             warning_line(&warning),
-            "   ! env: applies to future execs only; running processes keep their current environment"
+            "env: applies to future execs only; running processes keep their current environment"
         );
     }
 }

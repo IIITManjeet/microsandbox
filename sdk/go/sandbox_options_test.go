@@ -1,7 +1,9 @@
 package microsandbox
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -744,28 +746,52 @@ func TestFFIWireShape_DeploymentProfile(t *testing.T) {
 }
 
 func TestFFIWireShape_Secrets(t *testing.T) {
-	got := marshalCreateOptions(t,
-		WithImage("alpine"),
-		WithSecrets(Secret.Env("OPENAI_API_KEY", "sk-xxx", SecretEnvOptions{
-			Allow:           []string{"api.openai.com", "*.openai.com"},
-			Passthrough:     []string{"api.anthropic.com"},
-			ViolationAction: ViolationActionBlockAndTerminate,
-		})),
-	)
-	secs := mustField(t, got, "secrets").([]any)
-	if len(secs) != 1 {
-		t.Fatalf("secrets length = %d", len(secs))
-	}
-	s := secs[0].(map[string]any)
-	if s["env_var"] != "OPENAI_API_KEY" || s["value"] != "sk-xxx" {
-		t.Fatalf("secret = %v", s)
-	}
-	if s["violation_action"] != "block-and-terminate" {
-		t.Fatalf("violation_action = %v", s["violation_action"])
-	}
-	hosts := s["allow"].([]any)
-	if len(hosts) != 2 || hosts[0] != "api.openai.com" || hosts[1] != "*.openai.com" {
-		t.Fatalf("allow = %v", hosts)
+	for _, test := range []struct {
+		name                    string
+		preferred, legacy, want []string
+	}{
+		{"preferred", []string{"api.anthropic.com"}, nil, []string{"api.anthropic.com"}},
+		{"legacy", nil, []string{"api.anthropic.com"}, []string{"api.anthropic.com"}},
+		{"combined", []string{"api.anthropic.com"}, []string{"*.anthropic.com"}, []string{"api.anthropic.com", "*.anthropic.com"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := marshalCreateOptions(t,
+				WithImage("alpine"),
+				WithSecrets(Secret.Env("OPENAI_API_KEY", "sk-xxx", SecretEnvOptions{
+					Allow:               []string{"api.openai.com", "*.openai.com"},
+					AllowPlaceholderFor: test.preferred,
+					Passthrough:         test.legacy,
+					ViolationAction:     ViolationActionBlockAndTerminate,
+				})),
+			)
+			secs := mustField(t, got, "secrets").([]any)
+			if len(secs) != 1 {
+				t.Fatalf("secrets length = %d", len(secs))
+			}
+			s := secs[0].(map[string]any)
+			if s["env_var"] != "OPENAI_API_KEY" || s["value"] != "sk-xxx" {
+				t.Fatalf("secret = %v", s)
+			}
+			if s["violation_action"] != "block-and-terminate" {
+				t.Fatalf("violation_action = %v", s["violation_action"])
+			}
+			hosts := s["allow"].([]any)
+			if len(hosts) != 2 || hosts[0] != "api.openai.com" || hosts[1] != "*.openai.com" {
+				t.Fatalf("allow = %v", hosts)
+			}
+			placeholders := s["passthrough"].([]any)
+			if len(placeholders) != len(test.want) {
+				t.Fatalf("passthrough = %v, want %v", placeholders, test.want)
+			}
+			for i, host := range test.want {
+				if placeholders[i] != host {
+					t.Fatalf("passthrough = %v, want %v", placeholders, test.want)
+				}
+			}
+			if _, ok := s["allow_placeholder_for"]; ok {
+				t.Fatal("new API name leaked into wire format")
+			}
+		})
 	}
 }
 
@@ -801,8 +827,9 @@ func TestFFIWireShape_NetworkCustomRules(t *testing.T) {
 			DNS: &DNSConfig{
 				Nameservers: []string{"1.1.1.1:53"},
 			},
-			IPv4Pool: "172.31.240.0/24",
-			IPv6Pool: "fd7a:115c:a1e0:100::/56",
+			IPv4Pool:      "172.31.240.0/24",
+			IPv6Pool:      "fd7a:115c:a1e0:100::/56",
+			NAT64Prefixes: []string{"2001:db8:64::/96"},
 		}),
 		WithProxy(SOCKS5Proxy("127.0.0.1:1080")),
 	)
@@ -834,6 +861,10 @@ func TestFFIWireShape_NetworkCustomRules(t *testing.T) {
 	}
 	if net["ipv6_pool"] != "fd7a:115c:a1e0:100::/56" {
 		t.Fatalf("ipv6_pool = %v", net["ipv6_pool"])
+	}
+	nat64 := net["nat64_prefixes"].([]any)
+	if len(nat64) != 1 || nat64[0] != "2001:db8:64::/96" {
+		t.Fatalf("nat64_prefixes = %v", nat64)
 	}
 	dns := net["dns"].(map[string]any)
 	ns := dns["nameservers"].([]any)
@@ -881,6 +912,27 @@ func TestFFIWireShape_NetworkConnectionLimits(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFFIWireShape_PublishedTCPConfiguration(t *testing.T) {
+	omitted := marshalCreateOptions(t, WithNetwork(&NetworkConfig{}))["network"].(map[string]any)
+	if value, present := omitted["tcp_accept_queue_size"]; present {
+		t.Fatalf("unset accept queue size reached the wire as %#v", value)
+	}
+
+	size := uint32(4096)
+	unlimited := uint(0)
+	got := marshalCreateOptions(t, WithNetwork(&NetworkConfig{
+		Ports:                    map[uint16]uint16{8080: 80},
+		TCPAcceptQueueSize:       &size,
+		MaxInboundTCPConnections: &unlimited,
+	}))["network"].(map[string]any)
+	if got["max_inbound_tcp_connections"] != float64(0) {
+		t.Fatalf("published TCP overrides lost: %#v", got)
+	}
+	if got["tcp_accept_queue_size"] != float64(4096) {
+		t.Fatalf("tcp_accept_queue_size = %#v, want 4096", got["tcp_accept_queue_size"])
 	}
 }
 
@@ -1087,5 +1139,84 @@ func TestNetworkStrictDefaultsAndOptOut(t *testing.T) {
 				t.Fatalf("strict = %v, want %v", network["strict"], tc.want)
 			}
 		})
+	}
+}
+
+func TestHTTPNetworkDenyMessageSurvivesFFIConversion(t *testing.T) {
+	implicit := buildFFINetwork(&NetworkConfig{})
+	if implicit.HTTP != nil {
+		t.Fatal("omitted HTTP config must inherit runtime defaults")
+	}
+	optOut := buildFFINetwork(&NetworkConfig{HTTP: &HTTPConfig{DenyResponse: false}})
+	if optOut.HTTP.DenyResponse || optOut.HTTP.DenyResponseFormat != "json" {
+		t.Fatal("explicit opt-out must preserve the JSON default format")
+	}
+	for _, enabled := range []bool{false, true} {
+		config := buildFFINetwork(&NetworkConfig{HTTP: &HTTPConfig{DenyResponse: enabled, DenyResponseFormat: HTTPDenyResponseJSON, DenyMessage: "legacy {host}", NetworkDenyMessage: "blocked {host}", SecretDenyMessage: "check secret access"}})
+		if config.HTTP.DenyResponse != enabled {
+			t.Fatalf("HTTP denial response flag lost")
+		}
+		if config.HTTP.DenyResponseFormat != "json" || config.HTTP.DenyMessage != "legacy {host}" {
+			t.Fatal("HTTP response format or legacy message lost")
+		}
+		if config.HTTP.NetworkDenyMessage != "blocked {host}" {
+			t.Fatalf("HTTP denial message lost: %q", config.HTTP.NetworkDenyMessage)
+		}
+		if config.HTTP.SecretDenyMessage != "check secret access" {
+			t.Fatalf("secret denial message lost: %q", config.HTTP.SecretDenyMessage)
+		}
+
+	}
+}
+
+func TestInvalidConfigRejectedBeforeCreate(t *testing.T) {
+	missingCA := filepath.Join(t.TempDir(), "missing.pem")
+	cases := []struct {
+		name    string
+		option  SandboxOption
+		message string
+		cause   error
+	}{
+		{"http", func(config *SandboxConfig) {
+			config.Network = &NetworkConfig{HTTP: &HTTPConfig{DenyResponse: true, DenyResponseFormat: "JSON"}}
+		}, "deny_response_format must be text or json", nil},
+		{"owned_mount", func(config *SandboxConfig) {
+			config.Volumes = map[string]MountConfig{"/data": {kind: MountKindOwned, Owned: "disk"}}
+		}, "disk storage requires positive SizeMiB", nil},
+		{"registry_ca", func(config *SandboxConfig) {
+			config.RegistryCACertPaths = []string{missingCA}
+		}, "reading registry CA certs", os.ErrNotExist},
+	}
+	for _, create := range []struct {
+		name string
+		call func(context.Context, string, ...SandboxOption) (*Sandbox, error)
+	}{
+		{"create", CreateSandbox},
+		{"connect_or_create", ConnectOrCreateSandbox},
+		{"progress", func(ctx context.Context, name string, opts ...SandboxOption) (*Sandbox, error) {
+			events, results := CreateSandboxWithProgress(ctx, name, opts...)
+			result := <-results
+			if _, ok := <-results; ok {
+				t.Error("expected exactly one creation result")
+			}
+			if _, ok := <-events; ok {
+				t.Error("invalid config must not emit progress")
+			}
+			return result.Sandbox, result.Err
+		}},
+	} {
+		for _, tc := range cases {
+			t.Run(create.name+"/"+tc.name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_, err := create.call(ctx, "invalid-config", tc.option)
+				if !IsKind(err, ErrInvalidConfig) || !strings.Contains(err.Error(), tc.message) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if tc.cause != nil && !errors.Is(err, tc.cause) {
+					t.Fatalf("lost underlying error: %v", err)
+				}
+			})
+		}
 	}
 }

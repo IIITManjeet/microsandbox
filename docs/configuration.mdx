@@ -1,6 +1,7 @@
 ---
-title: Global config reference
-description: Reference for the global config.json shared by the CLI and SDKs
+title: Global configuration
+"og:title": Microsandbox global configuration reference
+description: Configure microsandbox defaults for the CLI and SDKs using the shared config.json file.
 icon: "gear"
 ---
 
@@ -20,6 +21,8 @@ Administrators can enforce these same fields using a protected `managed.json` fi
 See [Managed deployment](/enterprise/managed-configuration) for deployment, precedence, clearing, and updates. This page remains the reference for individual fields and accepted values.
 
 ## Reference example
+
+Relative host paths stored in this file resolve from the file's directory, including `home`, `paths.*`, and `registries.ca_certs`. For example, `/etc/microsandbox/config.json` containing `"ca_certs": "./company.pem"` selects `/etc/microsandbox/company.pem`, regardless of the caller's working directory. This intentionally replaces the previous working-directory-relative interpretation. Use an absolute path to keep a location elsewhere. Programmatic SDK paths and environment defaults are captured relative to the caller's working directory when the backend is constructed. Guest paths, such as `sandbox_defaults.workdir`, are unaffected.
 
 <Accordion title="Full example">
 ```json
@@ -95,11 +98,17 @@ See [Managed deployment](/enterprise/managed-configuration) for deployment, prec
       }
     }
   },
+  "exec": {
+    "buffer_bytes": null
+  },
   "ssh": {
     "inactivity_timeout_secs": 600
   },
   "metrics": {
     "capacity": 4096
+  },
+  "snapshots": {
+    "max_filesystem_state_mib": 4
   },
   "active_profile": "prod",
   "profiles": {
@@ -127,8 +136,10 @@ See [Managed deployment](/enterprise/managed-configuration) for deployment, prec
 | `sandbox_defaults` | [reference](#sandbox_defaults) | Defaults applied to new sandboxes, subject to backend support |
 | `runtime` | [reference](#runtime) | Host runtime performance policy |
 | `registries` | [reference](#registries) | Container registry authentication |
+| `exec` | [reference](#exec) | Unread command-output buffer size |
 | `ssh` | [reference](#ssh) | Host-side SSH session defaults |
 | `metrics` | [reference](#metrics) | Live metrics shared-memory registry settings |
+| `snapshots` | [reference](#snapshots) | Full snapshot capture and restore limits |
 | `active_profile` | `null` | Default [backend profile](#profiles) name |
 | `profiles` | [reference](#profiles) | Named [backend profiles](/operations/backends#profiles) |
 
@@ -211,6 +222,22 @@ let runtime = microsandbox::setup::resolve_runtime(&cfg)?;
 `LocalBackendBuilder::build_lazy()` now returns `Result<LocalBackend>`. It replaces `try_build_lazy()`, and `LocalBackend` no longer implements `Default`; use `LocalBackend::lazy()?` instead.
 
 For a long-lived process, construct a new backend to pick up configuration changes. Installing it with `set_default_backend` affects future operations; existing sandbox and volume handles retain their original backend. Construct the replacement successfully before installing it.
+
+## `exec`
+
+| Field | Default | Description |
+|---|---|---|
+| `buffer_bytes` | `null` (unlimited) | Optional unread output limit per command, shared by stdout and stderr. Minimum: `65536` bytes (64 KiB). |
+
+With a limit set, a full buffer pauses output until it is read. This does not limit total
+collected output or total process memory. Set it before constructing a backend;
+existing streams keep their original limit.
+
+Older guests retain unbounded buffering and warn if a configured limit cannot
+be enforced. They remain usable without restarting.
+
+See [Slow output readers](/sandboxes/commands#slow-output-readers) for how limits
+affect guest writes and concurrent stdin/output.
 
 ## `ssh`
 
@@ -386,6 +413,18 @@ For local pulls without managed `auth`, microsandbox resolves credentials in thi
 | Field | Default | Description |
 |-------|---------|-------------|
 | `capacity` | `0` | Number of slots reserved in the live metrics shared-memory registry. `0` uses the built-in default. Stop all sandboxes for the same home before changing this value. |
+
+## `snapshots`
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_filesystem_state_mib` | `4` | Largest virtio-fs backend state, in MiB, that one filesystem device can carry through a full snapshot. Valid values are `1` through `4095`. |
+
+This limit applies per filesystem device during capture, verification, export, import, restore, and live forks.
+
+- **After changing it:** restart running sandboxes to update their capture limit. Host snapshot checks use the new limit immediately, so lowering it can reject captures from sandboxes still using a larger limit.
+- **When reading snapshots:** allow enough space for each device's saved state. The reader does not need to match the capture host's maximum. A smaller limit rejects oversized state before making changes.
+- **Before raising it:** consider memory use, especially when restoring imported snapshots. Raise it only for snapshots you trust.
 
 ## `profiles`
 

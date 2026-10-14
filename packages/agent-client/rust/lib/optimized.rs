@@ -120,6 +120,8 @@ pub enum AgentFrame {
 ///
 /// See the module-level docs for an overview of the two API tiers.
 pub struct AgentClient {
+    /// Native-local control only; tunneled streams must never dial a peer's host path.
+    exec_controller: Option<crate::ExecController>,
     /// Channel to the transport writer task.
     writer: mpsc::Sender<WriterCommand>,
     /// Next correlation ID to allocate (starts at `id_min`).
@@ -290,22 +292,28 @@ impl AgentClient {
         #[cfg(all(feature = "uds", unix))]
         {
             let stream = connect_local_stream(sock_path, deadline).await?;
-            match Self::connect_uds_stream_with_deadline(stream, deadline, true).await {
-                Ok(client) => Ok(client),
+            let mut client = match Self::connect_uds_stream_with_deadline(stream, deadline, true)
+                .await
+            {
+                Ok(client) => client,
                 Err(AgentClientError::LocalTransport(error)) if Instant::now() < deadline => {
                     // No operation exists yet, so a fresh connection is the only safe fallback
                     // after a malformed or interrupted ancillary-data exchange.
                     tracing::warn!(%error, "agent client: local shared-arena upgrade failed; reconnecting in-band");
                     let stream = connect_local_stream(sock_path, deadline).await?;
-                    Self::connect_uds_stream_with_deadline(stream, deadline, false).await
+                    Self::connect_uds_stream_with_deadline(stream, deadline, false).await?
                 }
-                Err(error) => Err(error),
-            }
+                Err(error) => return Err(error),
+            };
+            client.exec_controller = crate::ExecController::from_ready_body(&client.ready_body)?;
+            Ok(client)
         }
         #[cfg(all(feature = "named-pipe", windows))]
         {
             let stream = connect_local_stream(sock_path, deadline).await?;
-            Self::connect_stream_with_deadline(stream, deadline).await
+            let mut client = Self::connect_stream_with_deadline(stream, deadline).await?;
+            client.exec_controller = crate::ExecController::from_ready_body(&client.ready_body)?;
+            Ok(client)
         }
     }
 
@@ -623,7 +631,37 @@ impl AgentClient {
         self.ensure_version_compat(t)?;
         let flags = t.flags();
         let body = encode_message_body(self.protocol.version(), t, payload)?;
+        if t == MessageType::ExecSignal
+            && let Some(controller) = self.exec_controller.as_ref()
+        {
+            let envelope = microsandbox_protocol::wire::Envelope::decode(&body)
+                .map_err(|error| AgentClientError::Cbor(error.to_string()))?;
+            let signal = envelope
+                .payload::<microsandbox_protocol::exec::ExecSignal>()
+                .map_err(|error| AgentClientError::Cbor(error.to_string()))?;
+            // This bypasses the writer FIFO and socket backpressure, while the runtime verifies
+            // the original connection and execution before touching the guest correlation.
+            return controller.signal(id, signal.signal).await;
+        }
         self.write_frame_owned(id, flags, body).await
+    }
+
+    /// Send a typed message through the writer, committing a reservation at admission.
+    ///
+    /// `admitted` runs synchronously immediately before enqueueing the frame. If this
+    /// future is cancelled beforehand, the callback is dropped without being called.
+    /// After admission, cancellation does not retract the queued frame.
+    pub async fn send_with_admission<T: Serialize>(
+        &self,
+        id: u32,
+        t: MessageType,
+        payload: &T,
+        admitted: impl FnOnce(),
+    ) -> AgentClientResult<()> {
+        self.ensure_version_compat(t)?;
+        let body = encode_message_body(self.protocol.version(), t, payload)?;
+        self.write_frame_admitted(id, t.flags(), body, admitted)
+            .await
     }
 
     /// Sends one generation-8 raw bulk record on an existing correlation.
@@ -686,6 +724,8 @@ impl AgentClient {
     /// IDs are single-use for this connection. Exhaustion requires reconnecting for a fresh range
     /// incarnation; wrap-around could relabel late raw records as a new operation.
     async fn reserve_id(&self, tx: mpsc::Sender<InboundFrame>) -> AgentClientResult<u32> {
+        // Renamed `try_update` in Rust 1.99; keep older toolchains building.
+        #[allow(deprecated)]
         let id = self
             .next_id
             .fetch_update(
@@ -719,14 +759,27 @@ impl AgentClient {
 
     /// Write a single framed message to the socket, taking ownership of the body.
     async fn write_frame_owned(&self, id: u32, flags: u8, body: Vec<u8>) -> AgentClientResult<()> {
+        self.write_frame_admitted(id, flags, body, || {}).await
+    }
+
+    async fn write_frame_admitted(
+        &self,
+        id: u32,
+        flags: u8,
+        body: Vec<u8>,
+        admitted: impl FnOnce(),
+    ) -> AgentClientResult<()> {
         let (ack, written) = oneshot::channel();
-        self.writer
-            .send(WriterCommand {
-                frame: WriterFrame::Control(RawFrame { id, flags, body }),
-                ack,
-            })
+        let slot = self
+            .writer
+            .reserve()
             .await
             .map_err(|_| AgentClientError::Closed)?;
+        admitted();
+        slot.send(WriterCommand {
+            frame: WriterFrame::Control(RawFrame { id, flags, body }),
+            ack,
+        });
         written.await.map_err(|_| AgentClientError::Closed)?
     }
 }
@@ -847,6 +900,7 @@ where
     let writer_handle = tokio::spawn(stream_writer_loop(writer, writer_rx));
 
     Ok(AgentClient {
+        exec_controller: None,
         writer: writer_tx,
         next_id: AtomicU32::new(first_request_id(handshake.id_min)),
         id_min: handshake.id_min,
@@ -1635,6 +1689,7 @@ mod tests {
             rows: 24,
             cols: 80,
             rlimits: Vec::new(),
+            output_window: None,
         };
         let (id, _rx) = client
             .stream(MessageType::ExecRequest, &request)
@@ -1792,7 +1847,16 @@ mod tests {
             agent_version: "stream-test".to_string(),
             ..Default::default()
         };
-        let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
+        let capability = microsandbox_protocol::exec_control::ExecControlReady {
+            version: 1,
+            endpoint: "/remote-host-only/control.sock".into(),
+            connection: [0; 16],
+        };
+        let advertisement = microsandbox_protocol::exec_control::ExecControlAdvertisement {
+            ready: &ready,
+            exec_control: &capability,
+        };
+        let ready_msg = Message::with_payload(MessageType::Ready, 0, &advertisement).unwrap();
 
         tokio::spawn(async move {
             // Relay handshake: [id_min][id_max] then the core.ready frame.
@@ -1828,6 +1892,8 @@ mod tests {
 
         assert_eq!(client.protocol(), AgentProtocol::Current);
         assert_eq!(client.agent_version(), "stream-test");
+        // A remote peer's host path must never become a local dial target for a supplied stream.
+        assert!(client.exec_controller.is_none());
         assert!(client.supports(MessageType::ExecRequest));
 
         let request = ExecRequest {
@@ -1840,6 +1906,7 @@ mod tests {
             rows: 24,
             cols: 80,
             rlimits: Vec::new(),
+            output_window: None,
         };
         let (_id, mut rx) = client
             .stream(MessageType::ExecRequest, &request)

@@ -493,9 +493,16 @@ const (
 type THPPolicy string
 
 // WithForked restores a full snapshot with private copy-on-write memory.
-// It cannot be combined with a fresh boot or disk-only restore.
+//
+// Deprecated: use WithCowMemory instead.
 func WithForked() RestoreOption {
 	return func(o *RestoreConfig) { o.Forked = true }
+}
+
+// WithCowMemory restores a full snapshot with private copy-on-write memory.
+// It cannot be combined with a fresh boot or disk-only restore.
+func WithCowMemory() RestoreOption {
+	return func(o *RestoreConfig) { o.CowMemory = true }
 }
 
 // WithExternalMountPolicy selects strict (default) or relaxed validation of mapped filesystems.
@@ -1012,6 +1019,21 @@ func WithNetwork(net *NetworkConfig) SandboxOption {
 	return func(o *SandboxConfig) { o.Network = net }
 }
 
+// WithInterceptTLS enables TLS interception while preserving existing network and
+// TLS settings. A later WithNetwork replaces the network configuration.
+func WithInterceptTLS() SandboxOption {
+	return func(o *SandboxConfig) {
+		network := NetworkConfig{}
+		if o.Network != nil {
+			network = *o.Network
+		}
+		if network.TLS == nil {
+			network.TLS = &TLSConfig{}
+		}
+		o.Network = &network
+	}
+}
+
 // WithProxy sets the single proxy used for outbound sandbox connections.
 func WithProxy(proxy *OutboundProxy) SandboxOption {
 	return func(o *SandboxConfig) { o.Proxy = proxy }
@@ -1079,7 +1101,7 @@ type RegistryAuth struct {
 // ---------------------------------------------------------------------------
 
 // OutboundProxy configures the single proxy used for outbound connections.
-// Construct one with a protocol-specific function such as SOCKS5Proxy.
+// Construct one with a protocol-specific function such as HTTPConnectProxy.
 type OutboundProxy struct {
 	protocol       string
 	address        string
@@ -1118,6 +1140,12 @@ func SOCKS4Proxy(address string, options ...SOCKS4ProxyOptions) *OutboundProxy {
 // SOCKS5Proxy configures a SOCKS5 outbound proxy at address.
 func SOCKS5Proxy(address string) *OutboundProxy {
 	return &OutboundProxy{protocol: "socks5", address: address}
+}
+
+// HTTPConnectProxy configures an HTTP proxy that opens outbound TCP tunnels
+// with CONNECT at address.
+func HTTPConnectProxy(address string) *OutboundProxy {
+	return &OutboundProxy{protocol: "http_connect", address: address}
 }
 
 // Credentials returns a copy configured with SOCKS5 username authentication
@@ -1173,6 +1201,13 @@ type NetworkConfig struct {
 	// PortBindings makes sandbox services reachable on explicit host bind addresses.
 	PortBindings []PortBinding
 
+	// TCPAcceptQueueSize sets the accept-queue depth for published TCP port listeners,
+	// 1 to 2147483647. Nil keeps the default, 1024; the host kernel clamps it to its somaxconn.
+	TCPAcceptQueueSize *uint32
+
+	// MaxInboundTCPConnections caps active inbound TCP connections; zero is unlimited. Nil uses the runtime default.
+	MaxInboundTCPConnections *uint
+
 	// IPv4Pool is used to derive per-sandbox /30 guest subnets.
 	// Defaults to "172.16.0.0/12".
 	IPv4Pool string
@@ -1180,6 +1215,10 @@ type NetworkConfig struct {
 	// IPv6Pool is used to derive per-sandbox /64 guest prefixes.
 	// Defaults to "fd42:6d73:62::/48".
 	IPv6Pool string
+
+	// NAT64Prefixes are NAT64 /96 prefixes used for policy classification.
+	// Defaults to "64:ff9b::/96".
+	NAT64Prefixes []string
 
 	// MaxConnections caps TCP connections.
 	// Deprecated: use MaxTCPConnections instead; specifying both is an error.
@@ -1198,6 +1237,37 @@ type NetworkConfig struct {
 
 	// TrustHostCAs ships the host's extra CA bundles into the guest.
 	TrustHostCAs *bool
+
+	// HTTP configures HTTP denial responses.
+	HTTP *HTTPConfig
+}
+
+// HTTPDenyResponseFormat selects the denial response contract.
+type HTTPDenyResponseFormat string
+
+const (
+	// HTTPDenyResponseText preserves legacy plain-text network denials.
+	HTTPDenyResponseText HTTPDenyResponseFormat = "text"
+	// HTTPDenyResponseJSON enables JSON network and secret denials.
+	HTTPDenyResponseJSON HTTPDenyResponseFormat = "json"
+)
+
+// HTTPConfig configures HTTP denial responses.
+type HTTPConfig struct {
+	// DenyResponseFormat defaults to JSON when empty.
+	DenyResponseFormat HTTPDenyResponseFormat
+	// DenyMessage sets the legacy text message with {host} substitution.
+	// Deprecated: use JSON mode and NetworkDenyMessage for new integrations.
+	DenyMessage string
+	// DenyResponse enables readable HTTP denial responses. A nil HTTP config enables JSON
+	// responses by default; when supplying HTTPConfig, set true to keep them enabled.
+	DenyResponse bool
+	// NetworkDenyMessage sets the network-denial JSON message in JSON mode. Requires DenyResponse.
+	// Used as-is. Empty uses the default message.
+	NetworkDenyMessage string
+	// SecretDenyMessage sets the literal secret-denial JSON message.
+	// Empty uses the default message. Requires DenyResponse and JSON mode.
+	SecretDenyMessage string
 }
 
 // DNSConfig configures the in-VM DNS proxy.
@@ -1447,13 +1517,23 @@ type SecretEntry struct {
 // SecretSubstitution selects request locations where substitution is enabled.
 type SecretSubstitution struct {
 	Headers *bool
-	Query   bool
-	Body    bool
+	// HeaderFields restricts header substitution to these field names when
+	// non-empty (for example, []string{"authorization"}). Prefer this over
+	// substituting in every header: an untrusted guest can otherwise place the
+	// placeholder in a header the upstream host reflects back and read the
+	// real secret. An empty slice allows every header field.
+	HeaderFields []string
+	Query        bool
+	Body         bool
 }
 
 // SecretEnvOptions tunes Secret.Env beyond the required envVar and value.
 type SecretEnvOptions struct {
-	Allow              []string
+	Allow []string
+	// AllowPlaceholderFor lists hosts that may receive the unchanged placeholder
+	// where substitution does not apply. Combined with Passthrough when both are set.
+	AllowPlaceholderFor []string
+	// Deprecated: use AllowPlaceholderFor instead.
 	Passthrough        []string
 	Placeholder        string
 	RequireTLSIdentity *bool
@@ -1476,11 +1556,13 @@ var Secret secretFactory
 // Env returns a SecretEntry bound to an environment variable. Pass an empty
 // SecretEnvOptions{} if no additional tuning is needed.
 func (secretFactory) Env(envVar, value string, opts SecretEnvOptions) SecretEntry {
+	placeholderHosts := append([]string(nil), opts.AllowPlaceholderFor...)
+	placeholderHosts = append(placeholderHosts, opts.Passthrough...)
 	return SecretEntry{
 		EnvVar:             envVar,
 		Value:              value,
 		Allow:              opts.Allow,
-		Passthrough:        opts.Passthrough,
+		Passthrough:        placeholderHosts,
 		Placeholder:        opts.Placeholder,
 		RequireTLSIdentity: opts.RequireTLSIdentity,
 		Substitution:       opts.Substitution,

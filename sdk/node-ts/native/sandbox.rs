@@ -7,11 +7,14 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::Mutex;
 
+use crate::jobs::{JsJob, job_error, json, list_options};
+
 use crate::attach_options_builder::JsAttachOptionsBuilder;
 use crate::error::to_napi_error;
 use crate::exec::{ExecOutput, JsExecHandle};
 use crate::exec_options_builder::JsExecOptionsBuilder;
 use crate::fs::JsSandboxFsOps;
+use crate::mount_builder::JsMountBuilder;
 use crate::sandbox_handle::{
     JsSandboxHandle, SandboxDestroyOptions, SandboxRestartOptions, destroy_options, restart_options,
 };
@@ -109,6 +112,51 @@ impl Sandbox {
 
 #[napi]
 impl Sandbox {
+    /// Retrieve a retained managed job in this sandbox.
+    #[napi]
+    pub async fn get_job(&self, id: String) -> Result<JsJob> {
+        let sb = self.inner.get().await.ok_or_else(consumed_error)?;
+        Ok(JsJob {
+            inner: sb.get_job(id).await.map_err(job_error)?,
+        })
+    }
+
+    /// List bounded managed-job metadata without creating processes.
+    #[napi]
+    pub async fn list_jobs(&self, all: bool, limit: u32, cursor: Option<String>) -> Result<String> {
+        let options = list_options(all, limit, cursor)?;
+        let sb = self.inner.get().await.ok_or_else(consumed_error)?;
+        json(sb.list_jobs_with(|_| options).await.map_err(job_error)?)
+    }
+
+    /// Launch with runtime-owned I/O, retaining pipe input by default.
+    #[napi]
+    pub async fn exec_detached(&self, cmd: String, args: Option<Vec<String>>) -> Result<JsJob> {
+        let sb = self.inner.get().await.ok_or_else(consumed_error)?;
+        Ok(JsJob {
+            inner: sb
+                .exec_detached(cmd, args.unwrap_or_default())
+                .await
+                .map_err(job_error)?,
+        })
+    }
+
+    #[napi(js_name = "execDetachedWithBuilder")]
+    pub async unsafe fn exec_detached_with_builder(
+        &self,
+        cmd: String,
+        builder: &mut JsExecOptionsBuilder,
+    ) -> Result<JsJob> {
+        let options = builder.take_inner_builder()?;
+        let sb = self.inner.get().await.ok_or_else(consumed_error)?;
+        Ok(JsJob {
+            inner: sb
+                .exec_detached_with(cmd, |_| options)
+                .await
+                .map_err(job_error)?,
+        })
+    }
+
     //----------------------------------------------------------------------------------------------
     // Static Methods — Creation
     //----------------------------------------------------------------------------------------------
@@ -582,44 +630,100 @@ impl Sandbox {
             .collect())
     }
 
-    /// Create an independent local CoW child without a durable full snapshot.
-    #[napi]
-    pub async fn branch(
+    /// @deprecated Use fork for live execution duplication.
+    #[napi(ts_return_type = "Promise<Sandbox>")]
+    pub fn branch<'env>(
         &self,
+        env: &'env Env,
         name: String,
         record_integrity: Option<bool>,
         guest_flush: Option<String>,
-    ) -> Result<Sandbox> {
-        let sb = self.inner.get().await.ok_or_else(consumed_error)?;
-        let mut builder = sb
-            .branch(name)
-            .guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?);
-        if record_integrity.unwrap_or(false) {
-            builder = builder.record_integrity();
-        }
-        Ok(Sandbox::from_rust(
-            builder.branch().await.map_err(to_napi_error)?,
-        ))
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Sandbox>> {
+        self.fork(env, name, record_integrity, guest_flush, volumes)
     }
 
-    /// Capture once and return individual child startup outcomes.
-    #[napi]
-    pub async fn branch_many(
+    /// @deprecated Use forkMany for live execution duplication.
+    #[napi(ts_return_type = "Promise<Array<JsBranchOutcome>>")]
+    pub fn branch_many<'env>(
         &self,
+        env: &'env Env,
         names: Vec<String>,
         record_integrity: Option<bool>,
         guest_flush: Option<String>,
-    ) -> Result<Vec<JsBranchOutcome>> {
-        let sb = self.inner.get().await.ok_or_else(consumed_error)?;
-        let mut builder = sb
-            .branch_many(names)
-            .guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?);
-        if record_integrity.unwrap_or(false) {
-            builder = builder.record_integrity();
-        }
-        Ok(branch_outcomes(
-            builder.branch().await.map_err(to_napi_error)?,
-        ))
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Vec<JsBranchOutcome>>> {
+        self.fork_many(env, names, record_integrity, guest_flush, volumes)
+    }
+
+    /// Create an independent local CoW child without a durable full snapshot.
+    #[napi(ts_return_type = "Promise<Sandbox>")]
+    pub fn fork<'env>(
+        &self,
+        env: &'env Env,
+        name: String,
+        record_integrity: Option<bool>,
+        guest_flush: Option<String>,
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Sandbox>> {
+        // Capture mounts and local paths before the async operation starts.
+        let volumes = JsMountBuilder::take_fork_volumes(
+            volumes.unwrap_or_default(),
+            self.backend_kind == "local",
+        );
+        let inner = self.inner.clone();
+
+        env.spawn_future(async move {
+            let volumes = volumes?;
+            let sb = inner.get().await.ok_or_else(consumed_error)?;
+            let mut builder = sb.fork(name);
+            builder =
+                builder.guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?);
+            if record_integrity.unwrap_or(false) {
+                builder = builder.record_integrity();
+            }
+            for (guest, mount) in volumes {
+                builder = builder.volume(guest, |_| mount);
+            }
+            Ok(Sandbox::from_rust(
+                builder.fork().await.map_err(to_napi_error)?,
+            ))
+        })
+    }
+
+    /// Capture once and return individual child startup outcomes.
+    #[napi(ts_return_type = "Promise<Array<JsBranchOutcome>>")]
+    pub fn fork_many<'env>(
+        &self,
+        env: &'env Env,
+        names: Vec<String>,
+        record_integrity: Option<bool>,
+        guest_flush: Option<String>,
+        volumes: Option<Vec<&mut JsMountBuilder>>,
+    ) -> Result<PromiseRaw<'env, Vec<JsBranchOutcome>>> {
+        // Capture mounts and local paths before the async operation starts.
+        let volumes = JsMountBuilder::take_fork_volumes(
+            volumes.unwrap_or_default(),
+            self.backend_kind == "local",
+        );
+        let inner = self.inner.clone();
+
+        env.spawn_future(async move {
+            let volumes = volumes?;
+            let sb = inner.get().await.ok_or_else(consumed_error)?;
+            let mut builder = sb.fork_many(names);
+            builder =
+                builder.guest_flush(crate::snapshot_builder::guest_flush_policy(guest_flush)?);
+            if record_integrity.unwrap_or(false) {
+                builder = builder.record_integrity();
+            }
+            for (guest, mount) in volumes {
+                builder = builder.volume(guest, |_| mount);
+            }
+            Ok(branch_outcomes(
+                builder.fork().await.map_err(to_napi_error)?,
+            ))
+        })
     }
 
     /// Explicit resident pause through host control.
@@ -832,7 +936,7 @@ impl Sandbox {
 //--------------------------------------------------------------------------------------------------
 
 pub(crate) fn branch_outcomes(
-    outcomes: Vec<microsandbox::sandbox::BranchOutcome>,
+    outcomes: Vec<microsandbox::sandbox::ForkOutcome>,
 ) -> Vec<JsBranchOutcome> {
     outcomes
         .into_iter()
@@ -1175,6 +1279,33 @@ pub(crate) fn configure_modify(
         workdir: options.workdir.clone(),
         secrets,
         secrets_remove: options.secrets_remove.clone().unwrap_or_default(),
+        ports: options
+            .ports
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|port| {
+                Ok(microsandbox::sandbox::PublishedPortSpec {
+                    host_port: modify_port_number(port.host_port, "hostPort")?,
+                    guest_port: modify_port_number(port.guest_port, "guestPort")?,
+                    host_bind: port.host_bind.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                    protocol: modify_port_protocol(port.protocol.as_deref())?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        ports_remove: options
+            .ports_remove
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|port| {
+                Ok(microsandbox::sandbox::PublishedPortKey {
+                    host_port: modify_port_number(port.host_port, "hostPort")?,
+                    host_bind: port.host_bind.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                    protocol: modify_port_protocol(port.protocol.as_deref())?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
 
     let builder = builder.with_patch(patch);
@@ -1188,6 +1319,27 @@ pub(crate) fn configure_modify(
             )));
         }
     })
+}
+
+fn modify_port_number(value: f64, name: &str) -> Result<u16> {
+    u16::try_from(crate::numeric::safe_integer(value, name)?)
+        .map_err(|_| Error::from_reason(format!("{name} must be between 1 and 65535")))
+}
+
+fn modify_port_protocol(protocol: Option<&str>) -> Result<microsandbox::sandbox::PortProtocol> {
+    match protocol.unwrap_or("tcp") {
+        "tcp" => Ok(microsandbox::sandbox::PortProtocol::Tcp),
+        "udp" => Ok(microsandbox::sandbox::PortProtocol::Udp),
+        value => Err(Error::from_reason(format!(
+            "invalid port protocol: {value}"
+        ))),
+    }
+}
+
+/// Whether this native library understands published-port modification.
+#[napi]
+pub fn supports_port_modification() -> bool {
+    true
 }
 
 pub(crate) fn modify_dry_run(options: Option<&SandboxModifyOptions>) -> bool {

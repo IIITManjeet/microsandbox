@@ -28,6 +28,8 @@ pub struct JsSecretEntry {
     pub passthrough_hosts: Vec<String>,
     /// Require verified TLS identity before substituting (default: true).
     pub require_tls_identity: bool,
+    /// Per-secret override of the network violation action.
+    pub violation_action: Option<String>,
     /// Where the secret may be injected into requests.
     // Keep the public name stable when napi-rs renders this renamed nested object.
     #[napi(ts_type = "SecretSubstitution")]
@@ -39,6 +41,8 @@ pub struct JsSecretEntry {
 #[napi(object, js_name = "SecretSubstitution")]
 pub struct JsSecretSubstitution {
     pub headers: bool,
+    /// When non-empty, restrict header substitution to these field names.
+    pub header_fields: Vec<String>,
     pub query: bool,
     pub body: bool,
 }
@@ -111,12 +115,19 @@ impl JsSecretBuilder {
         self
     }
 
-    /// Allow a host to receive the unchanged placeholder.
+    /// Allow a host to receive the unchanged placeholder where substitution does not apply.
+    /// Enabled substitution locations still receive the real secret on allowed hosts.
+    #[napi(js_name = "allowPlaceholderFor")]
+    pub fn allow_placeholder_for(&mut self, host: String) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.allow_placeholder_for(host));
+        self
+    }
+
+    /// @deprecated Use allowPlaceholderFor instead.
     #[napi(js_name = "allowPassthroughFor")]
     pub fn allow_passthrough_for(&mut self, host: String) -> &Self {
-        let prev = self.take_inner();
-        self.inner = Some(prev.allow_passthrough_for(host));
-        self
+        self.allow_placeholder_for(host)
     }
 
     /// Configure header substitution (default: true).
@@ -124,6 +135,19 @@ impl JsSecretBuilder {
     pub fn substitute_in_headers(&mut self, enabled: bool) -> &Self {
         let prev = self.take_inner();
         self.inner = Some(prev.substitute_in_headers(enabled));
+        self
+    }
+
+    /// Enable header substitution but restrict it to the given header fields.
+    ///
+    /// An empty list restores the default of substituting in every header.
+    /// Prefer restricting to the credential header the API reads: substituting
+    /// in every header lets an untrusted guest place the placeholder in a
+    /// header the upstream host reflects back, leaking the real secret.
+    #[napi(js_name = "substituteInHeaderFields")]
+    pub fn substitute_in_header_fields(&mut self, fields: Vec<String>) -> &Self {
+        let prev = self.take_inner();
+        self.inner = Some(prev.substitute_in_header_fields(fields));
         self
     }
 
@@ -229,8 +253,21 @@ pub(crate) fn to_js_secret_entry(entry: RustSecretEntry) -> JsSecretEntry {
             .map(host_pattern_string)
             .collect(),
         require_tls_identity: entry.require_tls_identity,
+        violation_action: entry.violation_action.map(|action| {
+            match action {
+                microsandbox_network::secrets::config::SecretViolationAction::Block => "block",
+                microsandbox_network::secrets::config::SecretViolationAction::BlockAndLog => {
+                    "block-and-log"
+                }
+                microsandbox_network::secrets::config::SecretViolationAction::BlockAndTerminate => {
+                    "block-and-terminate"
+                }
+            }
+            .to_string()
+        }),
         substitution: JsSecretSubstitution {
             headers: entry.substitution.headers,
+            header_fields: entry.substitution.header_fields,
             query: entry.substitution.query,
             body: entry.substitution.body,
         },

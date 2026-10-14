@@ -3,16 +3,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches};
 #[cfg(feature = "net")]
 use microsandbox::OutboundProxy;
 use microsandbox::VolumeKind;
 use microsandbox::backend::{Backend, LocalBackend};
 use microsandbox::sandbox::{
-    CpuPlacement, DeploymentProfile, DiskImageFormat, FlatClone, MountBuilder, Patch,
-    RootDiskBuilder, Sandbox, SandboxBuilder, SandboxHandle, SecurityProfile,
+    CpuPlacement, DeploymentProfile, DiskImageFormat, FlatClone, GuestClockPolicy, MountBuilder,
+    Patch, RootDiskBuilder, Sandbox, SandboxBuilder, SandboxHandle, SecurityProfile,
     TransparentHugePagePolicy, VolumeMount, VsockSocketType,
 };
+#[cfg(feature = "net")]
+use microsandbox_network::config::{PortProtocol, PublishedPort};
 #[cfg(feature = "net")]
 use microsandbox_network::{OutboundProxyBuilder, OutboundProxyConfig};
 #[cfg(feature = "net")]
@@ -147,6 +150,11 @@ pub struct SandboxOpts {
     #[arg(long, value_name = "POLICY", value_parser = ["always", "madvise", "never"])]
     pub thp: Option<String>,
 
+    /// Guest wall-clock policy: `sync` (default) keeps the guest clock in step with the
+    /// host; `off` leaves it alone after boot, including across full snapshot restores.
+    #[arg(long = "guest-clock", value_name = "POLICY", value_parser = guest_clock_parser())]
+    pub guest_clock: Option<GuestClockPolicy>,
+
     /// Mount a host path or named volume into the sandbox (`SOURCE:DEST[:OPTIONS]`).
     /// OPTIONS may include paired `uid=<N>,gid=<N>` for directory-backed mounts.
     #[arg(short, long)]
@@ -268,8 +276,9 @@ pub struct SandboxOpts {
     pub rm: Vec<String>,
 
     // --- Image/Runtime overrides ---
-    /// Override the image's default entrypoint command.
-    #[arg(long)]
+    /// Override the image's entrypoint executable. With `msb run`, pass its
+    /// arguments after the image and `--`.
+    #[arg(long, value_name = "EXECUTABLE")]
     pub entrypoint: Option<String>,
 
     /// Hand off PID 1 to this init binary inside the guest after agentd
@@ -346,10 +355,20 @@ pub struct SandboxOpts {
     pub vsock: Vec<String>,
 
     // --- Networking (requires "net" feature) ---
-    /// Forward a host port to the sandbox (HOST:GUEST, BIND_ADDR:HOST:GUEST, and /udp variants).
+    /// Forward host ports (HOST:GUEST or BIND_ADDR:HOST:GUEST, with equal-length ranges and /udp).
     #[cfg(feature = "net")]
     #[arg(short, long)]
     pub port: Vec<String>,
+
+    /// Accept-queue depth for published TCP ports (default: 1024; the host clamps it to its somaxconn).
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "DEPTH", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)))]
+    pub tcp_accept_queue_size: Option<u32>,
+
+    /// Maximum active inbound TCP connections across published ports; zero is unlimited.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub max_inbound_tcp_connections: Option<usize>,
 
     /// Disable all network access by default. Sugar for `--net-default deny`.
     /// Combine with `--net-rule allow@<target>` entries to build an
@@ -410,6 +429,11 @@ pub struct SandboxOpts {
     #[cfg(feature = "net")]
     #[arg(long = "net-ipv6-pool", value_name = "CIDR")]
     pub net_ipv6_pool: Option<String>,
+
+    /// NAT64 /96 prefix for policy classification. Repeatable.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-nat64-prefix", value_name = "CIDR")]
+    pub net_nat64_prefix: Vec<String>,
 
     /// Network rule. Repeatable; each value is a comma-separated list of
     /// rule tokens. Token grammar:
@@ -541,9 +565,9 @@ pub struct SandboxOpts {
     pub trust_host_cas: bool,
 
     /// Dial all outbound sandbox connections through this proxy.
-    /// Supports the socks4:// and socks5:// protocols.
+    /// Supports http://, socks4://, and socks5:// protocols.
     #[cfg(feature = "net")]
-    #[arg(long, value_name = "socks[4|5]://IP:PORT")]
+    #[arg(long, value_name = "http://IP:PORT|socks[4|5]://IP:PORT")]
     pub proxy: Option<String>,
 
     /// Optional user ID for a SOCKS4 proxy.
@@ -624,6 +648,13 @@ pub struct SandboxOpts {
     /// and stored only as a source reference, never inlined in the sandbox
     /// config. Inline `ENV=VALUE@HOST` is rejected; export the value and use
     /// `ENV[:OPTIONS]@HOST[,HOST...]`.
+    ///
+    /// OPTIONS are comma-separated: `no-headers`, `headers=[FIELD,...]`,
+    /// `query`, `body`, `passthrough=HOST`, or `passthrough=[HOST,...]`.
+    /// Headers are substituted by default; query and body substitution are off.
+    /// `headers=*` selects all headers. Passthrough sends the placeholder unchanged.
+    ///
+    /// Example: `--secret 'GH_TOKEN:passthrough=api.anthropic.com@github.com,api.github.com'`.
     #[cfg(feature = "net")]
     #[arg(long)]
     pub secret: Vec<String>,
@@ -643,6 +674,8 @@ pub(crate) struct ParsedSecret {
     pub(crate) allowed_hosts: Vec<String>,
     pub(crate) passthrough_hosts: Vec<String>,
     pub(crate) substitute_headers: bool,
+    /// When non-empty, restrict header substitution to these field names.
+    pub(crate) substitute_header_fields: Vec<String>,
     pub(crate) substitute_query: bool,
     pub(crate) substitute_body: bool,
 }
@@ -718,6 +751,22 @@ impl SandboxOpts {
         };
 
         match raw.parse::<OutboundProxy>()? {
+            OutboundProxy::HttpConnect { address } => {
+                if self.socks4_user_id.is_some()
+                    || self.socks5_username.is_some()
+                    || self.socks5_password_env.is_some()
+                {
+                    anyhow::bail!(
+                        "SOCKS authentication flags cannot be used with an http:// proxy"
+                    );
+                }
+
+                Ok(Some(
+                    OutboundProxyBuilder::new()
+                        .http_connect(address.to_string())
+                        .build()?,
+                ))
+            }
             OutboundProxy::Socks4 { address, .. } => {
                 if self.socks5_username.is_some() || self.socks5_password_env.is_some() {
                     anyhow::bail!(
@@ -816,6 +865,7 @@ impl SandboxOpts {
             || self.net_default_ingress.is_some()
             || self.net_ipv4_pool.is_some()
             || self.net_ipv6_pool.is_some()
+            || !self.net_nat64_prefix.is_empty()
             || self.net_egress_bandwidth.is_some()
             || self.net_egress_bandwidth_burst.is_some()
             || self.net_egress_ops.is_some()
@@ -827,6 +877,8 @@ impl SandboxOpts {
             || self.max_connections.is_some()
             || self.max_tcp_connections.is_some()
             || self.max_udp_connections.is_some()
+            || self.tcp_accept_queue_size.is_some()
+            || self.max_inbound_tcp_connections.is_some()
             || self.net_strict.is_some()
             || self.trust_host_cas
             || self.tls_intercept
@@ -1022,6 +1074,7 @@ impl SandboxOpts {
             || self.memory.is_some()
             || self.max_memory.is_some()
             || self.thp.is_some()
+            || self.guest_clock.is_some()
             || !self.volume.is_empty()
             || !self.mount_dir.is_empty()
             || !self.mount_file.is_empty()
@@ -1066,6 +1119,9 @@ impl SandboxOpts {
             || self.net_default.is_some()
             || self.net_default_egress.is_some()
             || self.net_default_ingress.is_some()
+            || self.net_ipv4_pool.is_some()
+            || self.net_ipv6_pool.is_some()
+            || !self.net_nat64_prefix.is_empty()
             || self.net_egress_bandwidth.is_some()
             || self.net_egress_bandwidth_burst.is_some()
             || self.net_egress_ops.is_some()
@@ -1077,6 +1133,8 @@ impl SandboxOpts {
             || self.max_connections.is_some()
             || self.max_tcp_connections.is_some()
             || self.max_udp_connections.is_some()
+            || self.tcp_accept_queue_size.is_some()
+            || self.max_inbound_tcp_connections.is_some()
             || self.net_strict.is_some()
             || self.trust_host_cas
             || self.proxy.is_some()
@@ -1300,6 +1358,9 @@ fn apply_sandbox_opts_inner(
             .map_err(anyhow::Error::msg)?;
         builder = builder.thp(policy);
     }
+    if let Some(policy) = opts.guest_clock {
+        builder = builder.guest_clock(policy);
+    }
     if let Some(ref workdir) = opts.workdir {
         builder = builder.workdir(workdir);
     }
@@ -1456,6 +1517,11 @@ fn apply_sandbox_opts_inner(
     }
 
     Ok(builder)
+}
+
+/// Parse the clock policy at the CLI boundary while retaining possible values in help.
+pub(crate) fn guest_clock_parser() -> impl TypedValueParser<Value = GuestClockPolicy> {
+    PossibleValuesParser::new(["sync", "off"]).try_map(|value| value.parse::<GuestClockPolicy>())
 }
 
 /// Parse `HOST_PATH:PORT[/stream|/dgram]` without treating colons in the
@@ -1987,6 +2053,14 @@ pub fn apply_explicit_disk_mount(
     builder: SandboxBuilder,
     spec: &str,
 ) -> anyhow::Result<SandboxBuilder> {
+    let (guest, mount) = parse_explicit_disk_mount(spec)?;
+    Ok(builder.volume(guest, |_| mount))
+}
+
+/// Parse a `--mount-disk` spec into its guest path and configured mount.
+///
+/// Shared by create, restore, and both fork forms.
+pub(crate) fn parse_explicit_disk_mount(spec: &str) -> anyhow::Result<(String, MountBuilder)> {
     let parsed = parse_cli_mount_spec(
         "mount-disk",
         spec,
@@ -1997,19 +2071,16 @@ pub fn apply_explicit_disk_mount(
         },
     )?;
 
-    let source = parsed.source.to_string();
     let guest = parsed.guest.to_string();
     let options = parsed.options;
-    Ok(builder.volume(guest, move |mut m| {
-        m = m.disk(&source);
-        if let Some(format) = options.format {
-            m = m.format(format);
-        }
-        if let Some(fstype) = options.fstype.as_deref() {
-            m = m.fstype(fstype);
-        }
-        apply_common_mount_options(m, options)
-    }))
+    let mut mount = MountBuilder::new(&guest).disk(parsed.source);
+    if let Some(format) = options.format {
+        mount = mount.format(format);
+    }
+    if let Some(fstype) = options.fstype.as_deref() {
+        mount = mount.fstype(fstype);
+    }
+    Ok((guest, apply_common_mount_options(mount, options)))
 }
 
 /// Apply a `--mount-named` spec to the builder.
@@ -2470,12 +2541,16 @@ fn apply_network_opts(
 
     // Port mappings.
     for port_str in &opts.port {
-        let (bind, host, guest, udp) = parse_port_mapping(port_str)?;
-        builder = if udp {
-            builder.port_udp_bind(bind, host, guest)
-        } else {
-            builder.port_bind(bind, host, guest)
-        };
+        for port in parse_port_mapping(port_str)? {
+            builder = match port.protocol {
+                PortProtocol::Udp => {
+                    builder.port_udp_bind(port.host_bind, port.host_port, port.guest_port)
+                }
+                PortProtocol::Tcp => {
+                    builder.port_bind(port.host_bind, port.host_port, port.guest_port)
+                }
+            };
+        }
     }
 
     // Some callers intentionally apply only additive ports after resolving network settings.
@@ -2497,6 +2572,23 @@ fn apply_network_opts(
                 extend_unique(&mut existing.allowed_hosts, parsed.allowed_hosts);
                 extend_unique(&mut existing.passthrough_hosts, parsed.passthrough_hosts);
                 existing.substitute_headers &= parsed.substitute_headers;
+                if existing.substitute_headers {
+                    match intersect_header_fields(
+                        &existing.substitute_header_fields,
+                        &parsed.substitute_header_fields,
+                    ) {
+                        Some(merged) => existing.substitute_header_fields = merged,
+                        None => {
+                            // The scopes share no field: the empty allowlist is
+                            // equivalent to disabling header substitution and
+                            // must not fall back to substituting in every header.
+                            existing.substitute_headers = false;
+                            existing.substitute_header_fields.clear();
+                        }
+                    }
+                } else {
+                    existing.substitute_header_fields.clear();
+                }
                 existing.substitute_query |= parsed.substitute_query;
                 existing.substitute_body |= parsed.substitute_body;
             }
@@ -2509,9 +2601,13 @@ fn apply_network_opts(
             var: env_var.clone(),
         };
         builder = builder.secret(|mut s| {
+            s = s.env(&env_var).source(source);
+            // `substitute_in_header_fields` enables header substitution, so the
+            // explicit enabled/disabled switch must be applied after it.
+            if !secret.substitute_header_fields.is_empty() {
+                s = s.substitute_in_header_fields(secret.substitute_header_fields.clone());
+            }
             s = s
-                .env(&env_var)
-                .source(source)
                 .substitute_in_headers(secret.substitute_headers)
                 .substitute_in_query(secret.substitute_query)
                 .substitute_in_body(secret.substitute_body);
@@ -2519,7 +2615,7 @@ fn apply_network_opts(
                 s = allow_secret_host(s, &host);
             }
             for host in secret.passthrough_hosts {
-                s = s.allow_passthrough_for(host);
+                s = s.allow_placeholder_for(host);
             }
             s
         });
@@ -2555,6 +2651,8 @@ fn apply_network_opts(
         }
         let max_conn = opts.max_tcp_connections.or(opts.max_connections);
         let max_udp_conn = opts.max_udp_connections;
+        let tcp_accept_queue_size = opts.tcp_accept_queue_size;
+        let max_inbound_tcp_connections = opts.max_inbound_tcp_connections;
         let ipv4_pool = opts
             .net_ipv4_pool
             .as_deref()
@@ -2571,6 +2669,14 @@ fn apply_network_opts(
                     .map_err(anyhow::Error::from)
             })
             .transpose()?;
+        let nat64_prefixes = opts
+            .net_nat64_prefix
+            .iter()
+            .map(|s| {
+                s.parse::<ipnetwork::Ipv6Network>()
+                    .map_err(anyhow::Error::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let trust_host_cas = opts.trust_host_cas;
         let net_strict = opts.net_strict;
         let tls_intercept = opts.tls_intercept;
@@ -2611,11 +2717,20 @@ fn apply_network_opts(
             if let Some(max) = max_udp_conn {
                 n = n.max_udp_connections(max);
             }
+            if let Some(value) = max_inbound_tcp_connections {
+                n = n.max_inbound_tcp_connections(value);
+            }
+            if let Some(size) = tcp_accept_queue_size {
+                n = n.tcp_accept_queue_size(size);
+            }
             if let Some(pool) = ipv4_pool {
                 n = n.ipv4_pool(pool);
             }
             if let Some(pool) = ipv6_pool {
                 n = n.ipv6_pool(pool);
+            }
+            for prefix in nat64_prefixes {
+                n = n.nat64_prefix(prefix);
             }
             if trust_host_cas {
                 n = n.trust_host_cas(true);
@@ -2795,8 +2910,9 @@ fn parse_rate(
 /// - `BIND_ADDR:HOST:GUEST/udp`
 ///
 /// IPv6 bind addresses must be bracketed, e.g. `[::]:8080:80`.
+/// HOST and GUEST may be inclusive `START-END` ranges of equal length.
 #[cfg(feature = "net")]
-pub(crate) fn parse_port_mapping(spec: &str) -> anyhow::Result<(std::net::IpAddr, u16, u16, bool)> {
+pub(crate) fn parse_port_mapping(spec: &str) -> anyhow::Result<Vec<PublishedPort>> {
     use std::net::{IpAddr, Ipv4Addr};
 
     let (port_part, udp) = if let Some(p) = spec.strip_suffix("/udp") {
@@ -2836,16 +2952,54 @@ pub(crate) fn parse_port_mapping(spec: &str) -> anyhow::Result<(std::net::IpAddr
         }
     };
 
-    let host: u16 = host_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid host port: {host_str}"))?;
-    let guest: u16 = guest_str
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid guest port: {guest_str}"))?;
+    let host = parse_published_port_range(host_str, "host")?;
+    let guest = parse_published_port_range(guest_str, "guest")?;
+    let host_count = u32::from(*host.end()) - u32::from(*host.start()) + 1;
+    let guest_count = u32::from(*guest.end()) - u32::from(*guest.start()) + 1;
+    anyhow::ensure!(
+        host_count == guest_count,
+        "host and guest port ranges must have equal lengths: {host_str}:{guest_str}"
+    );
 
-    Ok((bind, host, guest, udp))
+    Ok(host
+        .zip(guest)
+        .map(|(host_port, guest_port)| PublishedPort {
+            host_bind: bind,
+            host_port,
+            guest_port,
+            protocol: if udp {
+                PortProtocol::Udp
+            } else {
+                PortProtocol::Tcp
+            },
+        })
+        .collect())
+}
+
+/// Parse a single port or an inclusive range without changing single-port semantics.
+#[cfg(feature = "net")]
+fn parse_published_port_range(
+    value: &str,
+    side: &str,
+) -> anyhow::Result<std::ops::RangeInclusive<u16>> {
+    let parse = |port: &str| {
+        port.trim()
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("invalid {side} port: {value}"))
+    };
+    if let Some((start, end)) = value.trim().split_once('-') {
+        let start = parse(start)?;
+        let end = parse(end)?;
+        anyhow::ensure!(
+            start > 0 && end > 0,
+            "{side} port range endpoints must be between 1 and 65535: {value}"
+        );
+        anyhow::ensure!(start <= end, "{side} port range is reversed: {value}");
+        Ok(start..=end)
+    } else {
+        let port = parse(value)?;
+        Ok(port..=port)
+    }
 }
 
 /// Parse `--secret ENV[:OPTIONS]@HOST[,HOST...]` for `command`.
@@ -2892,15 +3046,85 @@ pub(crate) fn parse_secret(spec: &str, command: &str) -> anyhow::Result<ParsedSe
         allowed_hosts,
         passthrough_hosts: Vec::new(),
         substitute_headers: true,
+        substitute_header_fields: Vec::new(),
         substitute_query: false,
         substitute_body: false,
     };
     if let Some(options) = options {
+        // `no-headers` and `headers=` express opposite header scopes and must
+        // not be combined into an ambiguous or silently widened secret.
+        let mut header_scope_selected = false;
+        let mut headers_disabled = false;
         for option in split_secret_options(options)? {
             match option.as_str() {
-                "no-headers" => parsed.substitute_headers = false,
+                "no-headers" => {
+                    if header_scope_selected {
+                        anyhow::bail!(
+                            "secret cannot combine `no-headers` with a `headers=` scope; specify only one header scope"
+                        );
+                    }
+                    headers_disabled = true;
+                    parsed.substitute_headers = false;
+                }
                 "query" => parsed.substitute_query = true,
                 "body" => parsed.substitute_body = true,
+                value if value.starts_with("headers=") => {
+                    if headers_disabled {
+                        anyhow::bail!(
+                            "secret cannot combine `headers=` with `no-headers`; specify only one header scope"
+                        );
+                    }
+                    if header_scope_selected {
+                        anyhow::bail!("secret `headers=` scope may be specified only once");
+                    }
+                    let raw = value.trim_start_matches("headers=");
+                    let fields = raw
+                        .strip_prefix('[')
+                        .and_then(|value| value.strip_suffix(']'))
+                        .unwrap_or(raw);
+                    let mut parsed_fields: Vec<String> = Vec::new();
+                    let mut all_headers = false;
+                    for field in fields
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|field| !field.is_empty())
+                    {
+                        if field == "*" {
+                            // `headers=*` restores the default of all headers.
+                            all_headers = true;
+                            continue;
+                        }
+                        if !parsed_fields
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(field))
+                        {
+                            parsed_fields.push(field.to_string());
+                        }
+                    }
+                    // `*` means every header. Mixing it with concrete field names
+                    // is ambiguous and must not silently widen the scope to every
+                    // header (which would re-enable reflected-header secret
+                    // disclosure).
+                    if all_headers && !parsed_fields.is_empty() {
+                        anyhow::bail!(
+                            "secret header scope cannot combine `*` (all headers) with specific field names; use `headers=*` for all headers or list only the fields to substitute"
+                        );
+                    }
+                    // An empty or effectively-empty list (`headers=`, `headers=[]`,
+                    // `headers=[,,]`) must not silently select the broadest scope.
+                    if !all_headers && parsed_fields.is_empty() {
+                        anyhow::bail!(
+                            "secret header scope requires at least one field name; use `headers=*` for all headers"
+                        );
+                    }
+                    parsed.substitute_headers = true;
+                    parsed.substitute_header_fields = if all_headers {
+                        Vec::new()
+                    } else {
+                        parsed_fields
+                    };
+                    header_scope_selected = true;
+                }
                 value if value.starts_with("passthrough=") => {
                     let hosts = value.trim_start_matches("passthrough=");
                     let hosts = hosts
@@ -2919,7 +3143,7 @@ pub(crate) fn parse_secret(spec: &str, command: &str) -> anyhow::Result<ParsedSe
                     extend_unique(&mut parsed.passthrough_hosts, parsed_hosts);
                 }
                 other => anyhow::bail!(
-                    "invalid secret option: {other} (expected: no-headers, query, body, passthrough=HOST, or passthrough=[HOST,...])"
+                    "invalid secret option: {other} (expected: no-headers, headers=[FIELD,...], query, body, passthrough=HOST, or passthrough=[HOST,...])"
                 ),
             }
         }
@@ -2955,6 +3179,28 @@ fn split_secret_options(options: &str) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("secret options must not be empty");
     }
     Ok(result)
+}
+
+/// Intersect two header-field allowlists, where an empty list means "all".
+///
+/// An empty list on either side means every header, so the intersection is the
+/// other list. When both sides name fields but share none, the intersection is
+/// the empty set, which this encoding cannot represent (an empty list means
+/// "all"); `None` is returned so the caller can disable header substitution,
+/// the equivalent of allowing no field, instead of widening to every header.
+pub(crate) fn intersect_header_fields(left: &[String], right: &[String]) -> Option<Vec<String>> {
+    if left.is_empty() {
+        return Some(right.to_vec());
+    }
+    if right.is_empty() {
+        return Some(left.to_vec());
+    }
+    let intersection: Vec<String> = left
+        .iter()
+        .filter(|field| right.iter().any(|other| other.eq_ignore_ascii_case(field)))
+        .cloned()
+        .collect();
+    (!intersection.is_empty()).then_some(intersection)
 }
 
 fn extend_unique(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
@@ -3239,7 +3485,7 @@ pub fn resolve_command(
     }
 
     // Non-interactive with nothing to run.
-    ui::warn("no command provided and stdin is not a terminal");
+    ui::warn("no command provided or configured; pass a command after -- in non-interactive mode");
     Ok((None, vec![]))
 }
 
@@ -3429,6 +3675,31 @@ mod tests {
 
     #[cfg(feature = "net")]
     #[test]
+    fn tcp_accept_queue_size_flag_accepts_only_the_positive_c_int_range() {
+        let parse = |value: &str| {
+            SandboxOpts::augment_args(Command::new("test")).try_get_matches_from([
+                "test",
+                "--tcp-accept-queue-size",
+                value,
+            ])
+        };
+        for value in ["1", "4096", "2147483647"] {
+            let opts = SandboxOpts::from_arg_matches(&parse(value).unwrap()).unwrap();
+            assert_eq!(opts.tcp_accept_queue_size, Some(value.parse().unwrap()));
+            assert!(opts.has_network_config());
+            assert!(opts.has_creation_flags());
+        }
+        for value in ["0", "2147483648"] {
+            assert_eq!(
+                parse(value).unwrap_err().kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
     fn parse_rate_splits_value_and_duration() {
         let bytes = |s: &str| ui::parse_size_bytes(s).map_err(anyhow::Error::msg);
 
@@ -3576,6 +3847,104 @@ mod tests {
     }
 
     #[test]
+    fn parse_secret_supports_header_field_allowlist() {
+        let secret = parse_secret(
+            "API_KEY:headers=[authorization,x-api-key]@api.example.com",
+            "create",
+        )
+        .unwrap();
+        assert!(secret.substitute_headers);
+        assert_eq!(
+            secret.substitute_header_fields,
+            vec!["authorization", "x-api-key"]
+        );
+
+        // A single field does not require brackets.
+        let single =
+            parse_secret("API_KEY:headers=authorization@api.example.com", "create").unwrap();
+        assert_eq!(single.substitute_header_fields, vec!["authorization"]);
+
+        // `*` restores the default of every header.
+        let all = parse_secret("API_KEY:headers=*@api.example.com", "create").unwrap();
+        assert!(all.substitute_header_fields.is_empty());
+
+        // Mixing the wildcard with concrete field names must not silently widen
+        // the scope to every header.
+        for spec in [
+            "API_KEY:headers=[authorization,*]@api.example.com",
+            "API_KEY:headers=[*,authorization]@api.example.com",
+            "API_KEY:headers=[authorization,*,x-api-key]@api.example.com",
+        ] {
+            let err = parse_secret(spec, "create").unwrap_err().to_string();
+            assert!(err.contains("cannot combine"), "{spec}: {err}");
+        }
+
+        // Outside brackets the `*` is a separate option and is rejected too.
+        assert!(parse_secret("API_KEY:headers=authorization,*@api.example.com", "create").is_err());
+        // An empty or effectively empty list must not silently allow every header.
+        for spec in [
+            "API_KEY:headers=@api.example.com",
+            "API_KEY:headers=[]@api.example.com",
+            "API_KEY:headers=[,,]@api.example.com",
+            "API_KEY:headers=[ , ]@api.example.com",
+        ] {
+            let err = parse_secret(spec, "create").unwrap_err().to_string();
+            assert!(err.contains("at least one field name"), "{spec}: {err}");
+        }
+
+        // `no-headers` and a `headers=` scope are opposite intents and must
+        // not be combined, regardless of order.
+        for spec in [
+            "API_KEY:headers=authorization,no-headers,query@api.example.com",
+            "API_KEY:no-headers,headers=authorization,query@api.example.com",
+            "API_KEY:headers=*,no-headers,query@api.example.com",
+        ] {
+            let err = parse_secret(spec, "create").unwrap_err().to_string();
+            assert!(err.contains("header scope"), "{spec}: {err}");
+        }
+        // The same scope may not be repeated within one declaration.
+        let err = parse_secret(
+            "API_KEY:headers=authorization,headers=x-api-key@api.example.com",
+            "create",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only once"), "{err}");
+    }
+
+    #[test]
+    fn intersect_header_fields_maps_disjoint_scopes_to_no_substitution() {
+        // An empty list means "all", so a disjoint intersection must not be
+        // returned as an empty list: `None` tells the caller to disable header
+        // substitution rather than silently re-enable every header.
+        assert_eq!(
+            intersect_header_fields(&["authorization".to_string()], &["x-api-key".to_string()]),
+            None
+        );
+
+        // Overlapping scopes intersect case-insensitively.
+        assert_eq!(
+            intersect_header_fields(
+                &["Authorization".to_string(), "x-extra".to_string()],
+                &["authorization".to_string(), "x-api-key".to_string()],
+            ),
+            Some(vec!["Authorization".to_string()])
+        );
+
+        // An empty side means every header and yields the other scope.
+        assert_eq!(
+            intersect_header_fields(&[], &["authorization".to_string()]),
+            Some(vec!["authorization".to_string()])
+        );
+        assert_eq!(
+            intersect_header_fields(&["authorization".to_string()], &[]),
+            Some(vec!["authorization".to_string()])
+        );
+        // Both empty means every header.
+        assert_eq!(intersect_header_fields(&[], &[]), Some(Vec::new()));
+    }
+
+    #[test]
     fn parse_secret_rejects_inline_value_syntax() {
         for command in ["create", "modify"] {
             let err = parse_secret("API_KEY=literal@api.example.com", command)
@@ -3636,6 +4005,38 @@ mod tests {
                 HostPattern::Any,
             ]
         );
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn apply_sandbox_opts_disjoint_header_scopes_disable_header_substitution() {
+        // Repeating `--secret` for the same variable intersects the header
+        // scopes. Disjoint scopes allow no field, which must disable header
+        // substitution rather than fall back to substituting in every header.
+        let opts = SandboxOpts {
+            secret: vec![
+                "API_KEY:headers=authorization,query@api.example.com".into(),
+                "API_KEY:headers=x-api-key@api.example.com".into(),
+            ],
+            ..Default::default()
+        };
+
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let secrets = config
+            .spec
+            .network
+            .secrets
+            .expect("network secrets")
+            .secrets;
+
+        assert_eq!(secrets.len(), 1);
+        assert!(!secrets[0].substitution.headers);
+        assert!(secrets[0].substitution.header_fields.is_empty());
+        assert!(secrets[0].substitution.query);
     }
 
     #[cfg(feature = "net")]
@@ -3881,6 +4282,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_guest_clock_policy() {
+        for (args, expected) in [
+            (vec!["create"], None),
+            (
+                vec!["create", "--guest-clock", "sync"],
+                Some(GuestClockPolicy::Sync),
+            ),
+            (
+                vec!["create", "--guest-clock", "off"],
+                Some(GuestClockPolicy::Off),
+            ),
+        ] {
+            let matches = SandboxOpts::augment_args(Command::new("create"))
+                .try_get_matches_from(args)
+                .unwrap();
+            let opts = SandboxOpts::from_arg_matches(&matches).unwrap();
+            if expected.is_some() {
+                assert!(opts.has_creation_flags());
+            }
+
+            let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(config.spec.runtime.guest_clock, expected);
+        }
+
+        assert!(
+            SandboxOpts::augment_args(Command::new("create"))
+                .try_get_matches_from(["create", "--guest-clock", "host"])
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -4757,7 +5194,7 @@ mod tests {
     async fn apply_volume_dot_source_is_bind_mount() {
         match build_volume(".:/mnt").await {
             VolumeMount::Bind { host, guest, .. } => {
-                assert_eq!(host, PathBuf::from("."));
+                assert_eq!(host, std::path::absolute(".").unwrap());
                 assert_eq!(guest, "/mnt");
             }
             other => panic!("expected bind mount, got {other:?}"),
@@ -4768,7 +5205,7 @@ mod tests {
     async fn apply_volume_dot_dot_source_is_bind_mount() {
         match build_volume("..:/mnt").await {
             VolumeMount::Bind { host, guest, .. } => {
-                assert_eq!(host, PathBuf::from(".."));
+                assert_eq!(host, std::path::absolute("..").unwrap());
                 assert_eq!(guest, "/mnt");
             }
             other => panic!("expected bind mount, got {other:?}"),
@@ -4942,41 +5379,138 @@ mod tests {
     #[cfg(feature = "net")]
     #[test]
     fn port_without_bind_defaults_to_loopback() {
-        let (bind, host, guest, udp) = parse_port_mapping("8080:80").unwrap();
-        assert_eq!(bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        assert_eq!(host, 8080);
-        assert_eq!(guest, 80);
-        assert!(!udp);
+        let ports = parse_port_mapping("8080:80").unwrap();
+        assert_eq!(ports.len(), 1);
+        let port = &ports[0];
+        assert_eq!(
+            port.host_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(port.host_port, 8080);
+        assert_eq!(port.guest_port, 80);
+        assert_eq!(port.protocol, PortProtocol::Tcp);
     }
 
     #[cfg(feature = "net")]
     #[test]
     fn port_with_explicit_loopback_stays_loopback() {
-        let (bind, host, guest, udp) = parse_port_mapping("127.0.0.1:8080:80").unwrap();
-        assert_eq!(bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        assert_eq!(host, 8080);
-        assert_eq!(guest, 80);
-        assert!(!udp);
+        let ports = parse_port_mapping("127.0.0.1:8080:80").unwrap();
+        assert_eq!(ports.len(), 1);
+        let port = &ports[0];
+        assert_eq!(
+            port.host_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(port.host_port, 8080);
+        assert_eq!(port.guest_port, 80);
+        assert_eq!(port.protocol, PortProtocol::Tcp);
     }
 
     #[cfg(feature = "net")]
     #[test]
     fn port_with_ipv4_bind() {
-        let (bind, host, guest, udp) = parse_port_mapping("0.0.0.0:8080:80/udp").unwrap();
-        assert_eq!(bind, "0.0.0.0".parse::<std::net::IpAddr>().unwrap());
-        assert_eq!(host, 8080);
-        assert_eq!(guest, 80);
-        assert!(udp);
+        let ports = parse_port_mapping("0.0.0.0:8080:80/udp").unwrap();
+        assert_eq!(ports.len(), 1);
+        let port = &ports[0];
+        assert_eq!(
+            port.host_bind,
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(port.host_port, 8080);
+        assert_eq!(port.guest_port, 80);
+        assert_eq!(port.protocol, PortProtocol::Udp);
     }
 
     #[cfg(feature = "net")]
     #[test]
     fn port_with_bracketed_ipv6_bind() {
-        let (bind, host, guest, udp) = parse_port_mapping("[::]:8080:80/tcp").unwrap();
-        assert_eq!(bind, "::".parse::<std::net::IpAddr>().unwrap());
-        assert_eq!(host, 8080);
-        assert_eq!(guest, 80);
-        assert!(!udp);
+        let ports = parse_port_mapping("[::]:8080:80/tcp").unwrap();
+        assert_eq!(ports.len(), 1);
+        let port = &ports[0];
+        assert_eq!(port.host_bind, "::".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(port.host_port, 8080);
+        assert_eq!(port.guest_port, 80);
+        assert_eq!(port.protocol, PortProtocol::Tcp);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_ranges_expand_in_order_with_bind_and_protocol() {
+        for (spec, bind, protocol) in [
+            ("8000-8002:80-82", "127.0.0.1", PortProtocol::Tcp),
+            ("0.0.0.0:8000-8002:80-82/udp", "0.0.0.0", PortProtocol::Udp),
+            ("[::1]:8000-8002:80-82/tcp", "::1", PortProtocol::Tcp),
+            ("[::]:8000-8002:80-82/udp", "::", PortProtocol::Udp),
+        ] {
+            let ports = parse_port_mapping(spec).unwrap();
+            assert_eq!(ports.len(), 3);
+            for (offset, port) in ports.iter().enumerate() {
+                assert_eq!(port.host_bind, bind.parse::<std::net::IpAddr>().unwrap());
+                assert_eq!(port.host_port, 8000 + offset as u16);
+                assert_eq!(port.guest_port, 80 + offset as u16);
+                assert_eq!(port.protocol, protocol);
+            }
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_ranges_cover_issue_example_and_boundaries() {
+        let ports = parse_port_mapping("0.0.0.0:10240-11264:10240-11264/udp").unwrap();
+        assert_eq!(ports.len(), 1025);
+        assert_eq!(ports.first().unwrap().host_port, 10240);
+        assert_eq!(ports.last().unwrap().guest_port, 11264);
+        for spec in ["65535:65535-65535", "65535-65535:65535", "0:80"] {
+            assert_eq!(parse_port_mapping(spec).unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_ranges_expand_the_full_port_space_without_binding() {
+        for suffix in ["/tcp", "/udp"] {
+            let ports = parse_port_mapping(&format!("1-65535:1-65535{suffix}")).unwrap();
+            assert_eq!(ports.len(), 65535);
+            for (offset, port) in ports.iter().enumerate() {
+                assert_eq!(port.host_port, offset as u16 + 1);
+                assert_eq!(port.guest_port, offset as u16 + 1);
+                assert_eq!(
+                    port.protocol,
+                    if suffix == "/udp" {
+                        PortProtocol::Udp
+                    } else {
+                        PortProtocol::Tcp
+                    }
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_ranges_reject_invalid_specs() {
+        for (spec, message) in [
+            ("8000-8002:80-81", "equal lengths"),
+            ("8000:80-81", "equal lengths"),
+            ("8000-8001:80", "equal lengths"),
+            ("8002-8000:80-82", "host port range is reversed"),
+            ("8000-8002:82-80", "guest port range is reversed"),
+            ("0-1:80-81", "range endpoints"),
+            ("8000-8001:0-1", "range endpoints"),
+            ("65535-65536:80-81", "invalid host port"),
+            ("8000-8001:65535-65536", "invalid guest port"),
+            ("-1:80", "invalid host port"),
+            ("8000-:80", "invalid host port"),
+            ("8000:80-", "invalid guest port"),
+            ("8000-8001-8002:80", "invalid host port"),
+            ("abc:80", "invalid host port"),
+            ("8000:abc", "invalid guest port"),
+            ("8000:80/sctp", "invalid guest port"),
+            ("bad:8000:80", "invalid bind address"),
+        ] {
+            let error = parse_port_mapping(spec).unwrap_err();
+            assert!(error.to_string().contains(message), "{spec}: {error}");
+        }
     }
 
     // --- parse_script_path ---

@@ -29,6 +29,7 @@ pub mod sandbox;
 #[cfg(feature = "local")]
 pub mod setup;
 pub mod snapshot;
+pub mod storage;
 pub mod volume;
 
 pub use agent::{
@@ -67,6 +68,8 @@ pub use microsandbox_utils::size;
 #[cfg(feature = "local")]
 pub use progress::{CreationProgress, CreationProgressHandle, StartupPhase, StartupProgress};
 pub use sandbox::exec::{ExecControl, ExecEvent, ExecHandle};
+pub use sandbox::jobs;
+pub use sandbox::jobs::{Job, JobAttachment, JobError, JobId, JobInfo, JobResult};
 #[cfg(feature = "ssh")]
 pub use sandbox::ssh::{
     DEFAULT_SSH_HOST, DEFAULT_SSH_PORT, SandboxSshOps, SftpClient, SshAttachOptionsBuilder,
@@ -103,4 +106,5 @@ pub use snapshot::{
     SnapshotScope, SnapshotSpec, SnapshotState, SnapshotVerifyReport, UpperIntegrity,
     UpperVerifyStatus,
 };
+pub use storage::{Storage, StorageCategoryUsage, StorageItemUsage, StorageUsage};
 pub use volume::{Volume, VolumeConfig, VolumeHandle, VolumeKind, VolumeSpec};

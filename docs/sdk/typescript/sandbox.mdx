@@ -3158,7 +3158,7 @@ Dry-run or apply plan for a sandbox modification. Values never appear in a plan:
 | changes | [`PlannedChange`](#plannedchange)`[]` | Planned changes, one entry per field or secret |
 | conflicts | `{ field, message }[]` | Conflicts that must be resolved before the patch can apply |
 | warnings | `{ field, message }[]` | Non-fatal warnings, e.g. the future-execs-only env caveat |
-| resizeStatus | `ResourceResizeStatus[]` | Live resource resize outcomes, populated by apply when a live change ran (see below) |
+| resizeStatus | `ResourceResizeStatus[]` | Live resource resize outcomes, populated by apply when a live change ran; see [`ResourceResizeStatus`](#resourceresizestatus) |
 
 ### PlannedChange
 
@@ -3203,15 +3203,34 @@ Secret change in a modification plan. Values are omitted by construction; `befor
 | allowHosts | `string[]` | Allowed hosts after the requested change |
 | reason | `string \| null` | Human-readable reason for the classification, when useful |
 
-`ResourceResizeStatus` reports runtime convergence for a live resize; enforcement applies immediately, the guest converges asynchronously:
+### ResourceResizeStatus
 
-| Field | Type | Description |
-|-------|------|-------------|
-| resource | `"cpus" \| "memory"` | Resource being resized |
-| requested | `string` | Requested value |
-| actual | `string` | Actual value observed in the guest/runtime |
-| enforced | `string` | Host/VMM-enforced value |
-| state | `"accepted" \| "converging" \| "applied" \| "guest-refused" \| "failed"` | `"applied"` when requested, actual, and enforced match; `"converging"` while the guest is still onlining or offlining CPUs or plugging or releasing memory; `"guest-refused"` when the guest would not cooperate (the host enforces the new limit anyway) |
+Runtime convergence status for a live resize. Enforcement applies immediately; the guest converges asynchronously.
+
+<p className="msb-label">Fields</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>resource</code><span className="msb-type">&quot;cpus&quot; | &quot;memory&quot;</span></div>
+    <div className="msb-param-desc">Resource being resized.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>requested</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Requested value.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>actual</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Actual value observed in the guest/runtime.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>enforced</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Host/VMM-enforced value.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>state</code><span className="msb-type">&quot;accepted&quot; | &quot;converging&quot; | &quot;applied&quot; | &quot;guest-refused&quot; | &quot;failed&quot;</span></div>
+    <div className="msb-param-desc"><code>&quot;applied&quot;</code> when requested, actual, and enforced match; <code>&quot;converging&quot;</code> while the guest is still onlining or offlining CPUs or plugging or releasing memory; <code>&quot;guest-refused&quot;</code> when the guest would not cooperate (the host enforces the new limit anyway)</div>
+  </div>
+</div>
 
 A shrink stays `"converging"` until the guest releases the capacity. `"applied"`, `"guest-refused"`, and `"failed"` are terminal.
 

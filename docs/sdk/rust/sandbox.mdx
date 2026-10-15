@@ -3268,21 +3268,55 @@ When or whether a planned change can take effect. Serializes as the quoted strin
 
 Runtime convergence status for a live resource resize. Enforcement applies immediately; the guest converges asynchronously (onlining CPUs, plugging memory blocks).
 
-| Field | Type | Description |
-|-------|------|-------------|
-| resource | `ResourceKind` | `Cpus` or `Memory` |
-| requested | `String` | Requested value |
-| actual | `String` | Actual value observed in the guest/runtime |
-| enforced | `String` | Host/VMM-enforced value |
-| state | `ResourceConvergenceState` | Convergence state, see below |
+<p className="msb-label">Fields</p>
 
-| State | Description |
-|-------|-------------|
-| `Accepted` | The runtime accepted the request |
-| `Converging` | The guest and VMM are still converging on the requested state |
-| `Applied` | Desired, actual, and enforced state match. A shrink is applied only after the guest releases the CPUs or memory |
-| `GuestRefused` | The guest would not cooperate; the host enforces the new limit anyway |
-| `Failed` | The resize failed |
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>resource</code><span className="msb-type">ResourceKind</span></div>
+    <div className="msb-param-desc"><code>Cpus</code> or <code>Memory</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>requested</code><span className="msb-type">String</span></div>
+    <div className="msb-param-desc">Requested value.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>actual</code><span className="msb-type">String</span></div>
+    <div className="msb-param-desc">Actual value observed in the guest/runtime.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>enforced</code><span className="msb-type">String</span></div>
+    <div className="msb-param-desc">Host/VMM-enforced value.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>state</code><span className="msb-type">ResourceConvergenceState</span></div>
+    <div className="msb-param-desc">Convergence state, see below.</div>
+  </div>
+</div>
+
+<p className="msb-label">Values</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>Accepted</code></div>
+    <div className="msb-param-desc">The runtime accepted the request.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>Converging</code></div>
+    <div className="msb-param-desc">The guest and VMM are still converging on the requested state.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>Applied</code></div>
+    <div className="msb-param-desc">Desired, actual, and enforced state match. A shrink is applied only after the guest releases the CPUs or memory.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>GuestRefused</code></div>
+    <div className="msb-param-desc">The guest would not cooperate; the host enforces the new limit anyway.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>Failed</code></div>
+    <div className="msb-param-desc">The resize failed.</div>
+  </div>
+</div>
 
 `Applied`, `GuestRefused`, and `Failed` are terminal; [`wait_until_resized()`](#sb-wait_until_resized) returns once every resource reaches one of them.
 

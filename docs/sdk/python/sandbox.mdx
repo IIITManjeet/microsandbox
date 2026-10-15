@@ -2166,13 +2166,30 @@ Resource reported by a live-resize result.
 
 Observed convergence state for an accepted live resize.
 
-| Member | Value | Description |
-|--------|-------|-------------|
-| `ResourceConvergenceState.ACCEPTED` | `"accepted"` | Runtime accepted the request |
-| `ResourceConvergenceState.CONVERGING` | `"converging"` | Guest and VMM are still converging |
-| `ResourceConvergenceState.APPLIED` | `"applied"` | Desired, actual, and enforced values match. A shrink is applied only after the guest releases the capacity |
-| `ResourceConvergenceState.GUEST_REFUSED` | `"guest-refused"` | Guest refused or failed to cooperate |
-| `ResourceConvergenceState.FAILED` | `"failed"` | Resize failed |
+<p className="msb-label">Values</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ResourceConvergenceState.ACCEPTED</code><span className="msb-type">&quot;accepted&quot;</span></div>
+    <div className="msb-param-desc">Runtime accepted the request.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ResourceConvergenceState.CONVERGING</code><span className="msb-type">&quot;converging&quot;</span></div>
+    <div className="msb-param-desc">Guest and VMM are still converging.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ResourceConvergenceState.APPLIED</code><span className="msb-type">&quot;applied&quot;</span></div>
+    <div className="msb-param-desc">Desired, actual, and enforced values match. A shrink is applied only after the guest releases the capacity.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ResourceConvergenceState.GUEST_REFUSED</code><span className="msb-type">&quot;guest-refused&quot;</span></div>
+    <div className="msb-param-desc">Guest refused or failed to cooperate.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ResourceConvergenceState.FAILED</code><span className="msb-type">&quot;failed&quot;</span></div>
+    <div className="msb-param-desc">Resize failed.</div>
+  </div>
+</div>
 
 `APPLIED`, `GUEST_REFUSED`, and `FAILED` are terminal.
 

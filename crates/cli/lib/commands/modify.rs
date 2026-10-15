@@ -247,6 +247,16 @@ pub async fn run(args: ModifyArgs) -> anyhow::Result<()> {
                 }
                 return Err(ui::AlreadyRenderedError.into());
             }
+            Err(MicrosandboxError::Unsupported { .. }) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&applied)?);
+                } else {
+                    ui::success("Modified", &applied.sandbox);
+                    print_resize_status(&applied.resize_status);
+                    print_resize_unsupported(&args.name);
+                }
+                return Err(ui::AlreadyRenderedError.into());
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -282,7 +292,6 @@ async fn wait_for_resize(
     let first =
         match tokio::time::timeout(first_read_deadline(budget), handle.resize_status()).await {
             Ok(Ok(status)) => status,
-            Ok(Err(MicrosandboxError::Unsupported { .. })) => return (Ok(Vec::new()), false),
             Ok(Err(error)) => return (Err(error), false),
             Err(_) => return (Err(resize_timeout(name, budget, Vec::new())), false),
         };
@@ -365,6 +374,17 @@ fn print_resize_timeout(name: &str, timeout: Duration) {
             ui::ErrorLine::Cause("the host already enforces the new limit"),
             ui::ErrorLine::Hint("the guest may still converge"),
             ui::ErrorLine::Hint(&retry),
+        ],
+    );
+}
+
+fn print_resize_unsupported(name: &str) {
+    let restart = format!("run `msb restart {name}` to use the updated runtime, then retry --wait");
+    ui::error_with_lines(
+        "cannot wait for resize: the running sandbox does not report resize status",
+        &[
+            ui::ErrorLine::Cause("the modification was applied"),
+            ui::ErrorLine::Hint(&restart),
         ],
     );
 }
